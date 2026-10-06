@@ -1,0 +1,88 @@
+{
+  "name": "antigravity-acp-for-copilot",
+  "displayName": "Antigravity: Copilot Provider",
+  "description": "Use Google Antigravity's Gemini models in GitHub Copilot Chat, through Google's official Antigravity ACP server on your machine.",
+  "version": "0.1.0",
+  "type": "module",
+  "publisher": "DenizhanDaklr",
+  "license": "MIT",
+  "icon": "images/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zelosleone/Antigravity-ACP-For-Copilot"
+  },
+  "homepage": "https://github.com/zelosleone/Antigravity-ACP-For-Copilot#readme",
+  "bugs": {
+    "url": "https://github.com/zelosleone/Antigravity-ACP-For-Copilot/issues"
+  },
+  "engines": {
+    "vscode": "^1.118.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "keywords": [
+    "antigravity",
+    "gemini",
+    "google",
+    "acp",
+    "copilot"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ],
+  "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "antigravity-acp",
+        "displayName": "Antigravity",
+        "managementCommand": "antigravityAcp.manage"
+      }
+    ],
+    "commands": [
+      {
+        "command": "antigravityAcp.manage",
+        "title": "Antigravity: Manage"
+      },
+      {
+        "command": "antigravityAcp.signIn",
+        "title": "Antigravity: Sign In"
+      }
+    ],
+    "configuration": {
+      "title": "Antigravity for Copilot",
+      "properties": {
+        "antigravityAcp.allowBuiltInTools": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Let Antigravity run its own edit and command tools without asking. When off, edits and commands go through Copilot's tools, with Copilot's approvals and diffs; Antigravity's read-only tools still work."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./ && node build.mjs",
+    "lint": "eslint src",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@agentclientprotocol/sdk": "1.7.0",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@types/node": "20.19.30",
+    "@types/vscode": "^1.118.0",
+    "@typescript-eslint/eslint-plugin": "8.53.0",
+    "@typescript-eslint/parser": "8.53.0",
+    "@vscode/vsce": "^4.0.0",
+    "esbuild": "0.28.2",
+    "eslint": "9.39.2",
+    "typescript": "5.9.3",
+    "zod": "4.6.5"
+  }
+}

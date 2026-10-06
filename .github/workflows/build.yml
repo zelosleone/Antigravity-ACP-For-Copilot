@@ -1,0 +1,40 @@
+name: Build
+
+# Every push to main runs the checks, packages the extension and puts the .vsix on the
+# release for the version in package.json (rebuilt in place until the version changes).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - run: npm run lint
+      - run: npx -y knip
+      - name: Complexity cap of 8
+        run: pipx run lizard -C 8 -l typescript -w src
+      - run: npm run package
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$(node -p "require('./package.json').version")"
+          gh release delete "$tag" --cleanup-tag --yes || true
+          gh release create "$tag" ./*.vsix --target "$GITHUB_SHA" --title "$tag" \
+            --notes "Built from ${GITHUB_SHA::7}. Install with **Extensions: Install from VSIX...**"

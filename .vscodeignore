@@ -1,0 +1,11 @@
+.github/**
+.gitignore
+.vscode/**
+.vscodeignore
+node_modules/**
+src/**
+build.mjs
+eslint.config.js
+package-lock.json
+tsconfig.json
+*.vsix
