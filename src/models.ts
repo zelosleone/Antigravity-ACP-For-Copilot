@@ -1,5 +1,6 @@
 import type * as vscode from 'vscode';
 import type { ModelChoice } from './agent.js';
+import { PERMISSION_MODES, type PermissionMode } from './permissions.js';
 
 const EFFORTS = ['high', 'medium', 'low'];
 const EFFORT_SUFFIX = /^(.*?)\s*\((low|medium|high)\)$/i;
@@ -7,13 +8,15 @@ const EFFORT_SUFFIX = /^(.*?)\s*\((low|medium|high)\)$/i;
 const CONTEXT_WINDOW = 1_048_576;
 const MAX_OUTPUT_TOKENS = 65_536;
 
-interface EffortSchema {
-  properties: { reasoningEffort: { enum: string[]; default: string } & Record<string, unknown> };
+type Option = { enum: string[]; default: string } & Record<string, unknown>;
+
+interface ConfigSchema {
+  properties: { reasoningEffort?: Option; permissionMode: Option };
 }
 
 export type AgyModel = vscode.LanguageModelChatInformation & {
   readonly isBYOK: true;
-  readonly configurationSchema?: EffortSchema;
+  readonly configurationSchema: ConfigSchema;
   /** Antigravity's model id per effort level ('' when the model has no levels). */
   readonly variants: Record<string, string>;
 };
@@ -30,8 +33,12 @@ export function toModels(choices: readonly ModelChoice[]): AgyModel[] {
 
 /** Antigravity's model id for the picked effort, or the model's default effort. */
 export function pickVariant(model: AgyModel, configured: string | undefined): string {
-  const effort = configured !== undefined && model.variants[configured] ? configured : model.configurationSchema?.properties.reasoningEffort.default;
+  const effort = configured !== undefined && model.variants[configured] ? configured : model.configurationSchema.properties.reasoningEffort?.default;
   return model.variants[effort ?? ''] ?? Object.values(model.variants)[0];
+}
+
+export function pickMode(configured: string | undefined): PermissionMode {
+  return PERMISSION_MODES.find((mode) => mode.id === configured)?.id ?? 'copilot';
 }
 
 function toModel(name: string, variants: Record<string, string>): AgyModel {
@@ -49,23 +56,32 @@ function toModel(name: string, variants: Record<string, string>): AgyModel {
     maxOutputTokens: MAX_OUTPUT_TOKENS,
     capabilities: { toolCalling: true, imageInput: true },
     isBYOK: true,
-    configurationSchema: levels.length > 1 ? effortSchema(levels) : undefined,
+    configurationSchema: { properties: { ...(levels.length > 1 ? { reasoningEffort: effortOption(levels) } : {}), permissionMode: modeOption() } },
     variants,
   };
 }
 
-// Effort as an in-picker option, highest first; that is also the default.
-function effortSchema(levels: string[]): EffortSchema {
+// Copilot's picker shows one option per group next to the model: effort in 'navigation', and
+// permissions in 'tokens', the only other group it shows (normally a context-size choice).
+function effortOption(levels: string[]): Option {
   return {
-    properties: {
-      reasoningEffort: {
-        type: 'string',
-        title: 'Thinking Effort',
-        enum: levels,
-        enumItemLabels: levels.map((level) => level.charAt(0).toUpperCase() + level.slice(1)),
-        default: levels[0],
-        group: 'navigation',
-      },
-    },
+    type: 'string',
+    title: 'Thinking Effort',
+    enum: levels,
+    enumItemLabels: levels.map((level) => level.charAt(0).toUpperCase() + level.slice(1)),
+    default: levels[0],
+    group: 'navigation',
+  };
+}
+
+function modeOption(): Option {
+  return {
+    type: 'string',
+    title: 'Permissions',
+    enum: PERMISSION_MODES.map((mode) => mode.id),
+    enumItemLabels: PERMISSION_MODES.map((mode) => mode.label),
+    enumDescriptions: PERMISSION_MODES.map((mode) => mode.description),
+    default: 'copilot',
+    group: 'tokens',
   };
 }

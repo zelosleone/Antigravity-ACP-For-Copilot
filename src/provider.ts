@@ -1,29 +1,41 @@
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import * as vscode from 'vscode';
-import { Agent, AgentError } from './agent.js';
+import { Agent, AgentError, type ModelChoice } from './agent.js';
 import { Bridge } from './bridge.js';
 import { charsOf, parseRequest } from './convert.js';
-import { pickVariant, toModels, type AgyModel } from './models.js';
+import { pickMode, pickVariant, toModels, type AgyModel } from './models.js';
 import { Sessions } from './session.js';
 
 const MODELS_KEY = 'antigravityAcp.models';
-const API_KEY_SECRET = 'antigravityAcp.apiKey';
+const ENV_SECRET = 'antigravityAcp.env';
 const CHARS_PER_TOKEN = 4;
-const AUTH_LABELS: Record<string, string> = {
-  'oauth-personal': 'Google account',
-  'oauth-business': 'Gemini Enterprise',
-  'gemini-api-key': 'Gemini API key',
-  'agent-platform': 'Vertex AI',
-};
-const API_KEY_KINDS = [
-  { label: 'Gemini API key', description: 'From Google AI Studio', method: 'gemini-api-key', env: 'GEMINI_API_KEY' },
-  { label: 'Vertex AI API key', description: 'Gemini Enterprise Agent Platform', method: 'agent-platform', env: 'GOOGLE_API_KEY' },
+
+interface SignInMethod extends vscode.QuickPickItem {
+  id: string;
+  /** Environment the server needs for this method, asked for before signing in. */
+  inputs: { env: string; prompt: string; password?: boolean }[];
+}
+
+// Every sign-in method Antigravity's ACP server offers.
+const SIGN_IN_METHODS: readonly SignInMethod[] = [
+  { id: 'oauth-personal', label: 'Google account', detail: "Your Google AI plan, on Google's sign-in page", inputs: [] },
+  {
+    id: 'oauth-business',
+    label: 'Gemini Enterprise',
+    detail: "Your organization's Google Cloud project, on Google's sign-in page",
+    inputs: [
+      { env: 'GOOGLE_CLOUD_PROJECT', prompt: 'Google Cloud project ID' },
+      { env: 'GOOGLE_CLOUD_LOCATION', prompt: 'Location, e.g. global or us-central1' },
+    ],
+  },
+  { id: 'gemini-api-key', label: 'Gemini API key', detail: 'From Google AI Studio', inputs: [{ env: 'GEMINI_API_KEY', prompt: 'Gemini API key', password: true }] },
+  { id: 'agent-platform', label: 'Vertex AI API key', detail: 'Gemini Enterprise Agent Platform', inputs: [{ env: 'GOOGLE_API_KEY', prompt: 'Vertex AI API key', password: true }] },
 ];
 
 type Options = vscode.ProvideLanguageModelChatResponseOptions & {
-  readonly modelConfiguration?: { readonly reasoningEffort?: string };
-  readonly configuration?: { readonly reasoningEffort?: string };
+  readonly modelConfiguration?: { readonly reasoningEffort?: string; readonly permissionMode?: string };
+  readonly configuration?: { readonly reasoningEffort?: string; readonly permissionMode?: string };
 };
 
 export class AntigravityChatProvider implements vscode.LanguageModelChatProvider<AgyModel>, vscode.Disposable {
@@ -31,7 +43,7 @@ export class AntigravityChatProvider implements vscode.LanguageModelChatProvider
   readonly onDidChangeLanguageModelChatInformation = this.changed.event;
   private readonly agent: Agent;
   private readonly bridge = new Bridge();
-  private readonly sessions = new Sessions();
+  private readonly sessions: Sessions;
   private models: AgyModel[];
   private refreshing?: Promise<void>;
   private prompting = false;
@@ -41,7 +53,8 @@ export class AntigravityChatProvider implements vscode.LanguageModelChatProvider
     private readonly log: vscode.LogOutputChannel,
   ) {
     const version = String(context.extension.packageJSON.version);
-    this.agent = new Agent(context.globalStorageUri.fsPath, version, log, () => this.apiKeyEnv());
+    this.agent = new Agent(context.globalStorageUri.fsPath, version, log, () => this.env());
+    this.sessions = new Sessions(context.globalState);
     this.models = context.globalState.get<AgyModel[]>(MODELS_KEY, []);
   }
 
@@ -65,7 +78,8 @@ export class AntigravityChatProvider implements vscode.LanguageModelChatProvider
     token: vscode.CancellationToken,
   ): Promise<void> {
     const request = parseRequest(messages);
-    const settings = { model: pickVariant(model, configuredEffort(options)), tools: options.tools ?? [], builtInTools: allowBuiltInTools() };
+    const config = options.modelConfiguration ?? options.configuration;
+    const settings = { model: pickVariant(model, config?.reasoningEffort), tools: options.tools ?? [], mode: pickMode(config?.permissionMode) };
     const context = {
       agent: this.agent,
       bridge: this.bridge,
@@ -73,7 +87,7 @@ export class AntigravityChatProvider implements vscode.LanguageModelChatProvider
       system: request.system,
       conversation: conversationId(options),
       log: this.log,
-      onModels: (infos: Parameters<typeof toModels>[0]) => this.setModels(toModels(infos)),
+      onModels: (choices: ModelChoice[]) => this.setModels(toModels(choices)),
     };
     try {
       const session = await this.sessions.open(request, settings, context);
@@ -94,41 +108,14 @@ export class AntigravityChatProvider implements vscode.LanguageModelChatProvider
     return this.refreshing;
   }
 
-  /** Google's own sign-in page opens in the browser; the server keeps the tokens, never this extension. */
   async signIn(): Promise<void> {
-    if (await this.context.secrets.get(API_KEY_SECRET)) {
-      await this.context.secrets.delete(API_KEY_SECRET);
-      this.agent.restart();
-    }
-    const title = 'Antigravity: finish signing in with Google in your browser';
-    const done = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title, cancellable: true }, async (_progress, token) => {
-      const cancel = token.onCancellationRequested(() => this.agent.restart());
-      try {
-        await this.agent.authenticate('oauth-personal');
-        return true;
-      } catch (error) {
-        if (token.isCancellationRequested) return false;
-        throw error;
-      } finally {
-        cancel.dispose();
-      }
-    });
-    if (done) await this.refresh();
-  }
-
-  async useApiKey(): Promise<void> {
-    const kind = await vscode.window.showQuickPick(API_KEY_KINDS, { title: 'Antigravity: Use an API Key' });
-    const key = kind && (await vscode.window.showInputBox({ title: kind.label, prompt: kind.description, password: true, ignoreFocusOut: true }));
-    if (!kind || !key) return;
-    await this.context.secrets.store(API_KEY_SECRET, JSON.stringify({ [kind.env]: key }));
-    this.agent.restart();
-    await this.agent.authenticate(kind.method);
-    await this.refresh();
+    const method = await vscode.window.showQuickPick(SIGN_IN_METHODS, { title: 'Antigravity: Sign In' });
+    if (method) await this.signInWith(method);
   }
 
   async signOut(): Promise<void> {
     await this.agent.logout().catch((error: unknown) => this.log.warn(`Sign-out failed: ${String(error)}`));
-    await this.context.secrets.delete(API_KEY_SECRET);
+    await this.context.secrets.delete(ENV_SECRET);
     this.restart();
     this.setModels([]);
   }
@@ -139,9 +126,10 @@ export class AntigravityChatProvider implements vscode.LanguageModelChatProvider
   }
 
   describe(): string {
-    const auth = authType(join(this.context.globalStorageUri.fsPath, 'home'));
+    const auth = authType(this.agent.home);
+    const label = SIGN_IN_METHODS.find((method) => method.id === auth)?.label ?? auth;
     const version = this.agent.serverVersion;
-    return [`Antigravity: ${auth ? (AUTH_LABELS[auth] ?? auth) : 'signed out'}`, version && `ACP server ${version}`].filter(Boolean).join(' · ');
+    return [`Antigravity: ${label ?? 'signed out'}`, version && `ACP server ${version}`].filter(Boolean).join(' · ');
   }
 
   dispose(): void {
@@ -149,6 +137,31 @@ export class AntigravityChatProvider implements vscode.LanguageModelChatProvider
     this.bridge.dispose();
     this.agent.dispose();
     this.changed.dispose();
+  }
+
+  // Google's own sign-in page opens in the browser for the OAuth methods; the server keeps the
+  // tokens, never this extension. Keys and project settings reach the server as environment.
+  private async signInWith(method: SignInMethod): Promise<void> {
+    const env = await askInputs(method.inputs);
+    if (!env) return;
+    if (JSON.stringify(env) !== JSON.stringify(await this.env())) {
+      await this.context.secrets.store(ENV_SECRET, JSON.stringify(env));
+      this.restart();
+    }
+    const title = method.id.startsWith('oauth') ? 'Antigravity: finish signing in with Google in your browser' : `Antigravity: checking the ${method.label}`;
+    const done = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title, cancellable: true }, async (_progress, token) => {
+      const cancel = token.onCancellationRequested(() => this.agent.restart());
+      try {
+        await this.agent.authenticate(method.id);
+        return true;
+      } catch (error) {
+        if (token.isCancellationRequested) return false;
+        throw error;
+      } finally {
+        cancel.dispose();
+      }
+    });
+    if (done) await this.refresh();
   }
 
   private async load(): Promise<void> {
@@ -170,8 +183,8 @@ export class AntigravityChatProvider implements vscode.LanguageModelChatProvider
     this.changed.fire();
   }
 
-  private async apiKeyEnv(): Promise<Record<string, string>> {
-    const stored = await this.context.secrets.get(API_KEY_SECRET);
+  private async env(): Promise<Record<string, string>> {
+    const stored = await this.context.secrets.get(ENV_SECRET);
     return stored ? (JSON.parse(stored) as Record<string, string>) : {};
   }
 
@@ -184,11 +197,9 @@ export class AntigravityChatProvider implements vscode.LanguageModelChatProvider
   private async promptSetup(): Promise<void> {
     if (this.prompting) return;
     this.prompting = true;
-    const message = 'Sign in to Google Antigravity to use its models in Copilot Chat.';
-    const choice = await vscode.window.showInformationMessage(message, 'Sign In with Google', 'Use an API Key');
+    const choice = await vscode.window.showInformationMessage('Sign in to Google Antigravity to use its models in Copilot Chat.', 'Sign In');
     this.prompting = false;
-    if (choice === 'Sign In with Google') await this.signIn();
-    else if (choice) await this.useApiKey();
+    if (choice) await this.signIn();
   }
 
   // Remote folders don't exist on this machine, where the server runs.
@@ -204,6 +215,16 @@ export class AntigravityChatProvider implements vscode.LanguageModelChatProvider
   }
 }
 
+async function askInputs(inputs: SignInMethod['inputs']): Promise<Record<string, string> | undefined> {
+  const env: Record<string, string> = {};
+  for (const input of inputs) {
+    const value = await vscode.window.showInputBox({ title: 'Antigravity: Sign In', prompt: input.prompt, password: input.password, ignoreFocusOut: true });
+    if (!value) return undefined;
+    env[input.env] = value.trim();
+  }
+  return env;
+}
+
 // The server records the chosen sign-in method (not the credentials) in its settings.
 function authType(home: string): string | undefined {
   try {
@@ -212,14 +233,6 @@ function authType(home: string): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-function allowBuiltInTools(): boolean {
-  return vscode.workspace.getConfiguration('antigravityAcp').get<boolean>('allowBuiltInTools', false);
-}
-
-function configuredEffort(options: Options): string | undefined {
-  return options.modelConfiguration?.reasoningEffort ?? options.configuration?.reasoningEffort;
 }
 
 // Copilot passes its conversation id in modelOptions; it keeps two chats from sharing a session.

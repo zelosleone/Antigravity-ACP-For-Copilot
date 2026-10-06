@@ -1,10 +1,11 @@
 import type * as acp from '@agentclientprotocol/sdk';
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
 import { modelOption, type Agent, type ModelChoice, type SessionHandler } from './agent.js';
 import { errorResult, SERVER_NAME, toMcpTool, type Bridge, type ToolHost } from './bridge.js';
-import { firstPrompt, nonEmpty, resultsWithPrompt, toToolResult, type Block, type ChatRequest } from './convert.js';
+import { firstPrompt, modeNote, nonEmpty, resultsWithPrompt, toToolResult, type Block, type ChatRequest } from './convert.js';
+import { choose, decide, describe, inside, paths, type PermissionMode } from './permissions.js';
 
 // Quiet time is measured per chat: a chat stays active while any of its sessions (its subagents and
 // side requests included) is talking to Antigravity or Copilot.
@@ -19,11 +20,15 @@ const MAX_PARKED_SESSIONS = 2;
 // Antigravity waits on a tool's permission until Copilot has run it, so nothing more can arrive after
 // a call; this only lets events already on their way land in the same response.
 const SETTLE_MS = 50;
+// A closed session stays on the server's disk (a week), so its chat can resume it instead of replaying.
+const SAVED_KEY = 'antigravityAcp.savedSessions';
+const SAVED_MS = 7 * 24 * 60 * 60 * 1000;
 
 type Progress = vscode.Progress<vscode.LanguageModelResponsePart>;
 type State = 'busy' | 'awaiting' | 'idle' | 'closed';
 type Event =
   | { type: 'text'; text: string }
+  | { type: 'thought'; text: string }
   | { type: 'call'; id: string; name: string; input: object }
   | { type: 'end'; stopReason: acp.StopReason }
   | { type: 'error'; error: Error };
@@ -31,7 +36,7 @@ type Event =
 export interface SessionSettings {
   model: string;
   tools: readonly vscode.LanguageModelChatTool[];
-  builtInTools: boolean;
+  mode: PermissionMode;
 }
 
 export interface SessionContext {
@@ -51,6 +56,16 @@ interface Pending {
   cancel(): void;
 }
 
+/** Where a chat's session stood when it last finished a reply. */
+interface Saved {
+  id: string;
+  responses: number;
+  lastText: string;
+  cwd: string;
+  mode: PermissionMode;
+  at: number;
+}
+
 /**
  * One ACP session per Copilot conversation, inside the shared server. Antigravity asks permission
  * before each of Copilot's tools; the reply hands that call to Copilot and the permission stays open
@@ -67,9 +82,11 @@ export class Session implements SessionHandler, ToolHost {
   private settings: SessionSettings;
   private model = '';
   private models: string[] = [];
+  private readonly key?: string;
   private readonly inbox = new Inbox<Event>();
   private readonly pending = new Map<string, Pending>();
   private readonly ready: { name: string; key: string; result: CallToolResult }[] = [];
+  private readonly shown = new Set<string>();
   private usage?: { used: number; size: number };
   private removeTools?: () => void;
   private oneShot = false;
@@ -77,8 +94,11 @@ export class Session implements SessionHandler, ToolHost {
   constructor(
     private readonly context: SessionContext,
     settings: SessionSettings,
+    private readonly saved: SavedSessions,
   ) {
     this.settings = settings;
+    // A chat's subagents share its id but not its system prompt.
+    if (context.conversation) this.key = `${context.conversation}|${createHash('sha256').update(context.system).digest('hex').slice(0, 16)}`;
   }
 
   get conversation(): string | undefined {
@@ -91,35 +111,33 @@ export class Session implements SessionHandler, ToolHost {
     return request.results ? this.awaits(request) : this.idleAfter(request);
   }
 
+  /** Resumes the session this chat finished its last reply in, if the server kept it; else starts one that replays the history. */
   async begin(request: ChatRequest): Promise<void> {
-    const kind = request.fork ? 'one-off session for background compaction' : 'session';
-    this.context.log.info(`${this.settings.model}: new ${kind}, replaying ${request.history.length} earlier messages`);
     const { server, remove } = await this.context.bridge.add(this);
     this.removeTools = remove;
-    const created = await this.context.agent.newSession(this.context.cwd, [server], this);
-    this.id = created.sessionId;
-    const { choices, current } = modelOption(created.configOptions);
-    this.model = current ?? '';
-    this.models = choices.map((choice) => choice.id);
-    this.context.onModels(choices);
+    const saved = request.fork ? undefined : this.savedFor(request);
+    if (!request.fork) this.saved.put(this.key, undefined);
+    const prompt = (saved && (await this.reopen(saved, request, server))) || (await this.create(request, server));
     await this.useModel(this.settings.model);
-    // A replayed history already holds this many replies, so the next request counts on from here.
+    // A replayed or resumed history already holds this many replies, so the next request counts on from here.
     this.responses = request.assistantCount;
     // Nothing ever follows up on a side request, so its session goes as soon as it has answered.
     this.oneShot = request.fork;
-    this.send(firstPrompt(request, this.settings.builtInTools));
+    this.send(prompt);
   }
 
   async resume(request: ChatRequest, settings: SessionSettings): Promise<void> {
     this.state = 'busy';
     this.lastActive = Date.now();
+    this.saved.put(this.key, undefined);
     this.context.log.info(`${settings.model}: continuing with ${request.results ? 'tool results' : 'a new turn'}`);
     const previous = this.settings;
+    const prompt = [...(settings.mode === previous.mode ? [] : [modeNote(settings.mode)]), ...request.prompt];
     this.settings = { ...settings, model: previous.model };
-    if (request.results) return this.deliver(resultsWithPrompt(request.results, request.prompt));
+    if (request.results) return this.deliver(resultsWithPrompt(request.results, prompt));
     this.settings = settings;
     await this.switchModel(settings.model, toolNames(previous.tools) !== toolNames(settings.tools));
-    this.send(nonEmpty(request.prompt));
+    this.send(nonEmpty(prompt));
   }
 
   /** Streams one Copilot response: until Antigravity waits on one of Copilot's tools or its turn ends. */
@@ -154,17 +172,17 @@ export class Session implements SessionHandler, ToolHost {
   update(update: acp.SessionUpdate): void {
     this.lastActive = Date.now();
     if (update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text') this.push({ type: 'text', text: update.content.text });
+    else if (update.sessionUpdate === 'agent_thought_chunk' && update.content.type === 'text') this.push({ type: 'thought', text: update.content.text });
     else if (update.sessionUpdate === 'usage_update') this.usage = { used: update.used, size: update.size };
-    else if (update.sessionUpdate === 'tool_call') this.context.log.debug(`Antigravity: ${update.title}`);
+    else if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') this.showTool(update);
   }
 
   permission(request: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
     this.lastActive = Date.now();
     const tool = copilotTool(request.toolCall);
     if (tool) return this.handOver(request, tool);
-    const allowed = this.settings.builtInTools;
-    this.context.log.info(`${allowed ? 'Allowed' : 'Declined'} Antigravity's own tool: ${request.toolCall.title ?? 'unknown'}`);
-    return Promise.resolve(choose(request, allowed ? 'allow_once' : 'reject_once'));
+    this.context.log.info(`Antigravity's own tool (${this.settings.mode}): ${request.toolCall.title ?? 'unknown'}`);
+    return Promise.resolve(decide(request, this.settings.mode, this.context.agent.home));
   }
 
   exited(error: Error): void {
@@ -186,6 +204,50 @@ export class Session implements SessionHandler, ToolHost {
     const id = randomUUID();
     this.push({ type: 'call', id, name, input: args });
     return new Promise((resolve) => this.pending.set(id, { deliver: resolve, cancel: () => resolve(errorResult('The session ended before this tool ran.')) }));
+  }
+
+  private async create(request: ChatRequest, server: acp.McpServer): Promise<Block[]> {
+    const kind = request.fork ? 'one-off session for background compaction' : 'session';
+    this.context.log.info(`${this.settings.model}: new ${kind}, replaying ${request.history.length} earlier messages`);
+    const created = await this.context.agent.newSession(this.context.cwd, [server], this);
+    this.adopt(created.sessionId, created.configOptions);
+    return firstPrompt(request, this.settings.mode);
+  }
+
+  // Undefined when the server no longer has the session; a new one replays the history instead.
+  private async reopen(saved: Saved, request: ChatRequest, server: acp.McpServer): Promise<Block[] | undefined> {
+    try {
+      const resumed = await this.context.agent.resumeSession(saved.id, this.context.cwd, [server], this);
+      this.adopt(saved.id, resumed.configOptions);
+    } catch (error) {
+      this.context.log.warn(`Saved session ${saved.id} could not be resumed: ${String(error)}`);
+      return undefined;
+    }
+    this.context.log.info(`${this.settings.model}: resumed the saved session after ${request.history.length} messages`);
+    return nonEmpty([...(saved.mode === this.settings.mode ? [] : [modeNote(this.settings.mode)]), ...request.prompt]);
+  }
+
+  private adopt(id: string, options: acp.SessionConfigOption[] | null | undefined): void {
+    this.id = id;
+    const { choices, current } = modelOption(options);
+    this.model = current ?? '';
+    this.models = choices.map((choice) => choice.id);
+    this.context.onModels(choices);
+  }
+
+  private savedFor(request: ChatRequest): Saved | undefined {
+    const saved = this.key ? this.saved.get(this.key) : undefined;
+    if (!saved || request.results || saved.cwd !== this.context.cwd) return undefined;
+    return saved.responses === request.assistantCount && saved.lastText.trim() === request.lastText.trim() ? saved : undefined;
+  }
+
+  // Antigravity's own tools show in the chat once they run; Copilot's show as Copilot tool calls instead.
+  private showTool(call: acp.ToolCallUpdate): void {
+    if (call.status !== 'in_progress' || copilotTool(call) || this.shown.has(call.toolCallId)) return;
+    this.shown.add(call.toolCallId);
+    // Its plans, task lists and notes in its own home are internal.
+    if (paths(call).some((path) => inside(this.context.agent.home, path))) return;
+    this.push({ type: 'text', text: `\n\n> ${describe(call, this.context.cwd)}\n\n` });
   }
 
   private handOver(request: acp.RequestPermissionRequest, tool: { name: string; input: Record<string, unknown> }): Promise<acp.RequestPermissionResponse> {
@@ -257,7 +319,8 @@ export class Session implements SessionHandler, ToolHost {
     // Copilot reads this data part to drive its context window indicator.
     const used = this.usage?.used ?? 0;
     if (used > 0) progress.report(vscode.LanguageModelDataPart.json({ prompt_tokens: used, completion_tokens: 0, total_tokens: used }, 'usage'));
-    if (this.oneShot && this.state === 'idle') this.close();
+    if (this.oneShot && this.state === 'idle') return this.close();
+    if (this.state === 'idle') this.saved.put(this.key, { id: this.id, responses: this.responses, lastText: this.lastText, cwd: this.context.cwd, mode: this.settings.mode, at: Date.now() });
   }
 }
 
@@ -276,6 +339,9 @@ class Reply {
     } else if (event.type === 'text') {
       this.text += event.text;
       this.progress.report(new vscode.LanguageModelTextPart(event.text));
+    } else if (event.type === 'thought') {
+      const part = thinkingPart(event.text);
+      if (part) this.progress.report(part);
     } else if (event.type === 'call') {
       this.calls.push(event.id);
       this.progress.report(new vscode.LanguageModelToolCallPart(event.id, event.name, event.input));
@@ -285,19 +351,41 @@ class Reply {
   }
 }
 
+/** Where each chat's sessions stood when they last finished a reply, kept across windows and restarts. */
+class SavedSessions {
+  constructor(private readonly memento: vscode.Memento) {}
+
+  get(key: string): Saved | undefined {
+    return this.all()[key];
+  }
+
+  put(key: string | undefined, saved: Saved | undefined): void {
+    if (!key || (!saved && !this.get(key))) return;
+    const now = Date.now();
+    const kept = Object.entries(this.all()).filter(([other, entry]) => other !== key && now - entry.at < SAVED_MS);
+    void this.memento.update(SAVED_KEY, Object.fromEntries(saved ? [...kept, [key, saved]] : kept));
+  }
+
+  private all(): Record<string, Saved> {
+    return this.memento.get<Record<string, Saved>>(SAVED_KEY, {});
+  }
+}
+
 /** Live conversations, most recent first. Each runs its own harness (~90 MB), so keep few. */
 export class Sessions implements vscode.Disposable {
   private sessions: Session[] = [];
+  private readonly saved: SavedSessions;
   private readonly timer = setInterval(() => this.sweep(), 60_000);
 
-  constructor() {
+  constructor(memento: vscode.Memento) {
+    this.saved = new SavedSessions(memento);
     this.timer.unref();
   }
 
-  /** Continues the live session that holds this conversation, or starts one that replays it. */
+  /** Continues the live session that holds this conversation, or opens one (resumed or replayed). */
   async open(request: ChatRequest, settings: SessionSettings, context: SessionContext): Promise<Session> {
     const live = this.sessions.find((session) => session.continues(request, context.conversation));
-    const session = live ?? new Session(context, settings);
+    const session = live ?? new Session(context, settings, this.saved);
     // Both mark the session busy before their first await, so the sweep below spares it.
     const ready = live ? live.resume(request, settings) : session.begin(request);
     this.sessions = [session, ...this.sessions.filter((other) => other !== session)];
@@ -364,6 +452,12 @@ class Inbox<T> {
   }
 }
 
+// Gemini's thinking, where VS Code offers a part for it (not yet in the stable typings).
+function thinkingPart(text: string): vscode.LanguageModelResponsePart | undefined {
+  const Part = (vscode as { LanguageModelThinkingPart?: new (value: string) => vscode.LanguageModelResponsePart }).LanguageModelThinkingPart;
+  return Part ? new Part(text) : undefined;
+}
+
 // Each chat's latest activity across its sessions; sessions without a chat id stand alone.
 function chatActivity(sessions: Session[]): Map<string | undefined, number> {
   const chats = new Map<string | undefined, number>();
@@ -385,11 +479,6 @@ function copilotTool(call: acp.ToolCallUpdate): { name: string; input: Record<st
   if (mcp?.server !== SERVER_NAME || typeof mcp.tool !== 'string') return undefined;
   const input = (call.rawInput as { arguments?: unknown } | undefined)?.arguments;
   return { name: mcp.tool, input: isRecord(input) ? input : {} };
-}
-
-function choose(request: acp.RequestPermissionRequest, kind: acp.PermissionOptionKind): acp.RequestPermissionResponse {
-  const option = request.options.find((candidate) => candidate.kind === kind);
-  return option ? { outcome: { outcome: 'selected', optionId: option.optionId } } : { outcome: { outcome: 'cancelled' } };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

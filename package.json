@@ -2,7 +2,7 @@
   "name": "antigravity-acp-for-copilot",
   "displayName": "Antigravity: Copilot Provider",
   "description": "Use Google Antigravity's Gemini models in GitHub Copilot Chat, through Google's official Antigravity ACP server on your machine.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "publisher": "DenizhanDaklr",
   "license": "MIT",
@@ -54,17 +54,7 @@
         "command": "antigravityAcp.signIn",
         "title": "Antigravity: Sign In"
       }
-    ],
-    "configuration": {
-      "title": "Antigravity for Copilot",
-      "properties": {
-        "antigravityAcp.allowBuiltInTools": {
-          "type": "boolean",
-          "default": false,
-          "markdownDescription": "Let Antigravity run its own edit and command tools without asking. When off, edits and commands go through Copilot's tools, with Copilot's approvals and diffs; Antigravity's read-only tools still work."
-        }
-      }
-    }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

@@ -10,7 +10,7 @@ import { installedServer, installServer, type Server } from './runtime.js';
 const AUTH_REQUIRED = -32000;
 const SIGN_IN_LINK = /Open the following link to authenticate the ACP server: (https:\/\/\S+)/;
 const CANCELLED: acp.RequestPermissionResponse = { outcome: { outcome: 'cancelled' } };
-const SESSION_DATA_DAYS = 1;
+const SESSION_DATA_DAYS = 7;
 
 export class AgentError extends Error {
   constructor(
@@ -68,6 +68,11 @@ export class Agent implements vscode.Disposable {
     return this.live?.server.version ?? installedServer(this.runtimeDir)?.version;
   }
 
+  /** The server's own Antigravity home: its settings, sign-in and saved sessions. */
+  get home(): string {
+    return join(this.storage, 'home');
+  }
+
   /** Starts the server if it isn't running; every call below goes through here. */
   warm(): Promise<Running> {
     this.running ??= this.start().catch((error: unknown) => {
@@ -82,6 +87,18 @@ export class Agent implements vscode.Disposable {
     const session = await settle(connection.newSession({ cwd, mcpServers }), exited);
     this.handlers.set(session.sessionId, handler);
     return session;
+  }
+
+  /** Reopens a saved session, after it was closed or the server restarted; Antigravity keeps its full history. */
+  async resumeSession(sessionId: string, cwd: string, mcpServers: acp.McpServer[], handler: SessionHandler): Promise<acp.ResumeSessionResponse> {
+    const { connection, exited } = await this.warm();
+    this.handlers.set(sessionId, handler);
+    try {
+      return await settle(connection.resumeSession({ sessionId, cwd, mcpServers }), exited);
+    } catch (error) {
+      this.handlers.delete(sessionId);
+      throw error;
+    }
   }
 
   /** The account's models, read from a throwaway session. */
@@ -143,7 +160,7 @@ export class Agent implements vscode.Disposable {
     const server = installedServer(this.runtimeDir) ?? (await this.install());
     // A newer release, if any, is fetched in the background and used from the next start.
     void installServer(this.runtimeDir).catch((error: unknown) => this.log.warn(`Update check failed: ${String(error)}`));
-    const home = join(this.storage, 'home');
+    const home = this.home;
     mkdirSync(home, { recursive: true });
     pruneSessionData(home);
     const child = spawn(server.command, server.args, { cwd: home, env: await this.env(home), stdio: 'pipe', windowsHide: true });
@@ -216,8 +233,8 @@ export class Agent implements vscode.Disposable {
   }
 }
 
-// The server saves every session, but a lost session replays its transcript instead of reloading,
-// so saved ones past a day are only taking space. Other windows share this home, hence the age.
+// The server saves every session so a chat can resume it; ones untouched for a week are dropped.
+// Other windows share this home, hence going by age.
 function pruneSessionData(home: string): void {
   const cutoff = Date.now() - SESSION_DATA_DAYS * 24 * 60 * 60 * 1000;
   for (const dir of ['brain', 'conversations'].map((name) => join(home, 'antigravity-acp', name))) {

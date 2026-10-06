@@ -1,6 +1,7 @@
 import type { ContentBlock } from '@agentclientprotocol/sdk';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import * as vscode from 'vscode';
+import { PERMISSION_MODES, type PermissionMode } from './permissions.js';
 
 export type Block = Extract<ContentBlock, { type: 'text' | 'image' }>;
 type Message = vscode.LanguageModelChatRequestMessage;
@@ -49,8 +50,8 @@ export function parseRequest(messages: readonly Message[]): ChatRequest {
 }
 
 /** The opening message of a new session: Copilot's instructions, the replayed history, then the new content. */
-export function firstPrompt(request: ChatRequest, builtInTools: boolean): Block[] {
-  const blocks: Block[] = [{ type: 'text', text: instructions(request.system, builtInTools) }];
+export function firstPrompt(request: ChatRequest, mode: PermissionMode): Block[] {
+  const blocks: Block[] = [{ type: 'text', text: instructions(request.system, mode) }];
   if (request.history.length > 0) blocks.push({ type: 'text', text: transcript(request.history, request.results) });
   return [...blocks, ...nonEmpty(request.prompt)];
 }
@@ -78,15 +79,19 @@ export function charsOf(message: Message): number {
   return message.content.reduce<number>((chars, part) => chars + partChars(part), 0);
 }
 
+/** Tells a running session that the user switched permission modes. */
+export function modeNote(mode: PermissionMode): Block {
+  const { label, note } = PERMISSION_MODES.find((candidate) => candidate.id === mode) ?? PERMISSION_MODES[0];
+  return { type: 'text', text: `<permissions_changed>The user switched to ${label}. ${note}</permissions_changed>` };
+}
+
 // Antigravity keeps its own system prompt; Copilot's goes first in the conversation instead.
-function instructions(system: string, builtInTools: boolean): string {
-  const tools = builtInTools
-    ? 'Prefer them over your built-in tools for edits and terminal commands, so the user sees the changes in VS Code.'
-    : 'Use them for edits and terminal commands: your built-in edit and command tools are turned off here.';
+function instructions(system: string, mode: PermissionMode): string {
+  const { note } = PERMISSION_MODES.find((candidate) => candidate.id === mode) ?? PERMISSION_MODES[0];
   return [
     '<copilot_instructions>',
     'You are the model behind GitHub Copilot Chat in VS Code. The instructions below come from Copilot and take ' +
-      `precedence over your defaults. Copilot's tools are available to you with a vscode_ prefix (Copilot's read_file is vscode_read_file). ${tools}`,
+      `precedence over your defaults. Copilot's tools are available to you with a vscode_ prefix (Copilot's read_file is vscode_read_file). ${note}`,
     system,
     '</copilot_instructions>',
   ].join('\n\n');
