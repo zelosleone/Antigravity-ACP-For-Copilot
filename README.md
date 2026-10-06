@@ -1,36 +1,47 @@
 # Antigravity for Copilot
 
-Use your Google Antigravity plan's models in GitHub Copilot Chat. Requests go through Google's official Antigravity ACP server, the same one Zed and JetBrains install from the [ACP registry](https://agentclientprotocol.com/get-started/registry), running unmodified on your machine. You sign in with Google on Google's own page and the server keeps the tokens; this extension never sees them.
+Use your Google Antigravity plan's models in GitHub Copilot Chat. Requests go through Google's official Antigravity ACP server, the one Zed and JetBrains install from the [ACP registry](https://agentclientprotocol.com/get-started/registry), running unmodified on your machine. You sign in on Google's own page and the server keeps the tokens.
 
 1. Pick an Antigravity model in the Copilot Chat model picker. The first time, the extension downloads the server (about 125 MB) and asks you to sign in with Google.
 2. Next to the model, pick the thinking effort and the permissions.
 
-Nothing about the models is built in: the list, the thinking effort levels and the context windows come from the server, read again every time the server starts and whenever a chat starts.
-
-## Speed and memory
-
-Google's server is a PyInstaller one-file build that unpacks about 8,000 files into a new temp folder every time it starts, which takes half a minute. The extension unpacks them once per server version and starts the unchanged executable in PyInstaller's own already-unpacked mode, so the server is up in a few seconds. A session is also made ahead of time with your last model and permissions, so a new chat (or a subagent) starts without waiting for one, even if you write before it is ready. If a window crashes and leaves its server behind, the next start stops it.
-
-Each live session runs its own Antigravity process (about 130 MB), and the server can't close sessions, so it would keep every one it started until it exits. The extension stops a session's process itself once the chat is done with it (the one connected with that session's token on the tool bridge). Only the latest finished chat keeps its process, for 10 minutes; any other chat resumes from the server's disk in a few seconds when you come back to it. After VS Code has been in the background for 15 minutes with nothing running, the server stops; it starts again in the background as soon as you switch back. The extension itself is a single 67 KB file with no runtime dependencies.
+Models, effort levels and context windows all come from the server. Copilot keeps its own agent, tools, approvals and diffs; Gemini is the model behind them.
 
 ## Permissions
 
-Copilot's tools reach Antigravity over a local MCP bridge and always go through Copilot, with its own approvals and diffs. The **Permissions** option decides what happens with Antigravity's own built-in tools:
+These decide what happens with Antigravity's own built-in tools; Copilot's tools always go through Copilot.
 
-- **Copilot Tools** (default): its edit, command, question and subagent tools are turned off with the server's own tool filter, so changes show up as Copilot edits and the model reads a shorter prompt. Its read-only and web tools still work.
-- **Ask**: a dialog asks before each of its edits and commands, with the server's own choices (Allow Always, Allow, Deny).
+- **Copilot Tools** (default): Antigravity's edit, command, question and subagent tools are turned off, so changes show up as Copilot edits.
+- **Ask**: it asks before each of its own edits and commands.
 - **Auto Edit**: its file edits run without asking; commands still ask.
-- **YOLO**: everything runs without asking. Antigravity can then edit files and run commands anywhere on your machine.
+- **YOLO**: everything runs without asking, anywhere on your machine.
 
-What it runs itself shows up in the chat (`> Ran npm test`, `> Edited src/app.ts`). Its own notes, plans and task lists live in its private home and are always allowed. Type `/plan <task>` to have it write an implementation plan and wait for your go-ahead.
+## Faster and lighter than the server on its own
 
-## Sessions
+Measured on Windows against the same server version, run the standard way:
 
-Every tool call waits for Copilot's result however long it takes: Antigravity's own three-minute limit on tool calls doesn't apply, because the call is held at its permission step rather than on the wire. One server process runs per window and every chat is a session in it; a running agent keeps its session for as long as it takes. The server saves sessions for a week, so a chat that comes back later, even after a reload, resumes exactly where it was. Only when the history no longer lines up (an edited message, summarization) does a new session replay it as a transcript. The server runs with its own Antigravity home, so your global Antigravity MCP servers, rules and skills stay out of Copilot's chats.
+| | Server as shipped | With this extension |
+|---|---|---|
+| Server start | about 28 s: it unpacks about 8,000 files on every launch | 3 to 5 s: unpacked once per version |
+| New chat | waits 3 to 5 s for a new session | a session is ready ahead of time |
+| Finished chats | each keeps its ~130 MB process until the server exits | the process is stopped |
+| After an editor crash | the server keeps running | the next start stops it |
+| VS Code in the background | everything keeps running | stops after 15 min, back on focus |
 
-In autopilot, Copilot ends a turn with its `task_complete` tool. Gemini tends to call it without writing any answer, so each turn ends with a short reminder to answer first, and a `task_complete` that still comes before any answer is sent back.
+Tool calls never time out, however long Copilot takes, and chats resume where they left off after a reload. The extension is a single 67 KB file with no runtime dependencies.
 
-This is for using your own account for your own work. Google's [Antigravity terms](https://antigravity.google/terms) forbid using the service through third-party software that reuses its credentials; a Google moderator has said that running the official, unmodified binaries locally for a single user, with sign-in kept inside them, is supported, and points ACP editor integrations to this server. Don't run it as a shared service.
+## A message to Google
+
+Thank you for publishing an official ACP server: it's what makes integrations like this one possible. A few changes would make it faster and lighter for every ACP client, and let us drop our workarounds:
+
+1. **Start without unpacking.** The PyInstaller one-file build extracts about 8,000 files into a new temp folder on every launch, which takes about 30 seconds on Windows. A one-folder build would start in a few seconds.
+2. **Support `session/close`.** Each session runs its own harness process (about 130 MB), and the server keeps all of them until it exits. Supporting ACP's `session/close` would let clients free them; today this extension has to find and stop them itself.
+3. **Exit when stdin closes.** If a client crashes, the server keeps running in the background.
+4. **List each model's context window** with the model options, not only in usage updates after the first reply.
+
+## Your account
+
+This is for your own account and your own work. Google's [Antigravity terms](https://antigravity.google/terms) don't allow third-party software that reuses its credentials; this extension runs Google's official binaries unmodified, with sign-in kept inside them, which a Google moderator has said is supported for a single user. Don't run it as a shared service.
 
 ## Development
 
@@ -41,7 +52,5 @@ npm run lint      # includes a complexity cap of 8
 npx -y knip       # unused files, exports and dependencies
 npm run package   # builds the .vsix
 ```
-
-Every push to `main` runs the same checks in GitHub Actions and attaches the `.vsix` to the release for the version in `package.json`.
 
 Unofficial, not affiliated with Google. Antigravity and Gemini are trademarks of Google LLC.

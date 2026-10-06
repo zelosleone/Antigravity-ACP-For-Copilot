@@ -2,7 +2,7 @@
   "name": "antigravity-acp-for-copilot",
   "displayName": "Antigravity: Copilot Provider",
   "description": "Use your Google Antigravity plan's Gemini models in GitHub Copilot Chat, through Google's official Antigravity ACP server on your machine.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "type": "module",
   "publisher": "DenizhanDaklr",
   "license": "MIT",
