@@ -519,6 +519,8 @@ class Spares {
 
   // Setting the model it already has restarts nothing and answers with the current models.
   private async reread(spare: Spare): Promise<Spare> {
+    // Without a model picker the server only has its default model; there is nothing to read.
+    if (!spare.model) return spare;
     spare.choices = await this.agent.setModel(spare.id, spare.model);
     this.onModels(spare.choices);
     return spare;
@@ -684,10 +686,19 @@ function expired(state: State, quietMs: number, idleRank: number, parkedRank: nu
 
 /** The Copilot tool behind a tool call on our MCP server, if it is one. */
 function copilotTool(call: acp.ToolCallUpdate): { name: string; input: Record<string, unknown> } | undefined {
+  const name = copilotToolName(call);
+  if (!name) return undefined;
+  const raw = call.rawInput as { arguments?: unknown } | undefined;
+  const input = isRecord(raw?.arguments) ? raw.arguments : raw;
+  return { name, input: isRecord(input) ? input : {} };
+}
+
+// The server tags a call to an MCP tool with the server and tool; its title also reads "vscode_<tool>".
+function copilotToolName(call: acp.ToolCallUpdate): string | undefined {
   const mcp = (call._meta as { mcp?: { server?: unknown; tool?: unknown } } | undefined)?.mcp;
-  if (mcp?.server !== SERVER_NAME || typeof mcp.tool !== 'string') return undefined;
-  const input = (call.rawInput as { arguments?: unknown } | undefined)?.arguments;
-  return { name: mcp.tool, input: isRecord(input) ? input : {} };
+  if (mcp) return mcp.server === SERVER_NAME && typeof mcp.tool === 'string' ? mcp.tool : undefined;
+  const prefix = `${SERVER_NAME}_`;
+  return call.title?.startsWith(prefix) ? call.title.slice(prefix.length) : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

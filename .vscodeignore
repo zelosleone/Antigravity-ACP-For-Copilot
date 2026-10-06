@@ -9,3 +9,5 @@ eslint.config.js
 package-lock.json
 tsconfig.json
 *.vsix
+out/upstream.mjs
+knip.json

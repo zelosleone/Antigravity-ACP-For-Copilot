@@ -20,6 +20,8 @@ const PLATFORMS: Record<string, string> = {
   'linux-arm64': 'linux-aarch64',
 };
 const MARKER = 'server.json';
+// Written when a version fails to start: it is tried last from then on, until this extension updates.
+const FAILED = 'failed.json';
 const run = promisify(execFile);
 const inflateAsync = promisify(inflate);
 // The server is a PyInstaller one-file build: on every launch it unpacks ~8,000 files into a fresh temp
@@ -48,14 +50,38 @@ interface Entry {
   distribution: { binary: Record<string, Target | undefined> };
 }
 
-/** The newest server already unpacked under root. */
-export function installedServer(root: string): Server | undefined {
-  const versions = existsSync(root) ? readdirSync(root).filter((name) => existsSync(join(root, name, MARKER))) : [];
-  const newest = versions.sort(compareVersions).at(-1);
-  return newest ? (JSON.parse(readFileSync(join(root, newest, MARKER), 'utf8')) as Server) : undefined;
+/**
+ * The installed servers, newest first, except that one which failed to start under this extension
+ * version goes last: a broken release falls back to the one before it.
+ */
+export function installedServers(root: string, extensionVersion: string): Server[] {
+  const servers = (existsSync(root) ? readdirSync(root) : []).map((name) => readJson<Server>(join(root, name, MARKER))).filter((server) => server !== undefined);
+  const failed = (server: Server) => Number(readJson<{ extension?: string }>(join(root, server.version, FAILED))?.extension === extensionVersion);
+  return servers.sort((a, b) => failed(a) - failed(b) || compareVersions(b.version, a.version));
 }
 
-/** Downloads the registry's current server for this platform, unless it is already here, and drops older ones. */
+/** Remembers that a version didn't start, so the next start tries the others first. */
+export function markFailed(root: string, version: string, extensionVersion: string): void {
+  writeFileSync(join(root, version, FAILED), JSON.stringify({ extension: extensionVersion }));
+}
+
+/** A version that started stays; older ones it replaces go, unless another window still runs them. */
+export function keepWorking(root: string, version: string, inUse: readonly string[]): void {
+  rmSync(join(root, version, FAILED), { force: true });
+  for (const name of readdirSync(root)) {
+    if (compareVersions(name, version) >= 0 || inUse.includes(name)) continue;
+    try {
+      rmSync(join(root, name), { recursive: true, force: true });
+    } catch {
+      // in use
+    }
+  }
+}
+
+/**
+ * Downloads the registry's current server for this platform unless it is already here. Older versions
+ * stay until this one has started (see keepWorking).
+ */
 export async function installServer(root: string, onProgress?: (fraction: number) => void): Promise<Server> {
   const entry = (await (await fetch(REGISTRY)).json()) as Entry;
   const target = entry.distribution.binary[PLATFORMS[`${process.platform}-${process.arch}`] ?? ''];
@@ -63,7 +89,8 @@ export async function installServer(root: string, onProgress?: (fraction: number
   if (!target.archive.startsWith(DOWNLOADS)) throw new Error(`Refusing to download from ${target.archive}.`);
   const dir = join(root, entry.version);
   const marker = join(dir, MARKER);
-  if (existsSync(marker)) return JSON.parse(readFileSync(marker, 'utf8')) as Server;
+  const installed = readJson<Server>(marker);
+  if (installed) return installed;
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
   const zip = join(dir, 'server.zip');
@@ -72,8 +99,12 @@ export async function installServer(root: string, onProgress?: (fraction: number
   rmSync(zip);
   const server: Server = { version: entry.version, command: join(dir, target.cmd), args: target.args ?? [] };
   writeFileSync(marker, JSON.stringify(server));
-  prune(root, entry.version);
   return server;
+}
+
+/** PyInstaller's own variables: they point the unchanged executable at its unpacked files, instead of a fresh temp folder. */
+export function fastStartEnv(server: Server, unpacked: string): Record<string, string> {
+  return { _PYI_PARENT_PROCESS_LEVEL: '0', _PYI_APPLICATION_HOME_DIR: unpacked, _PYI_ARCHIVE_FILE: server.command };
 }
 
 /** The folder holding the server's unpacked files, unpacking them first if needed; undefined if it isn't a PyInstaller build. */
@@ -147,21 +178,19 @@ async function unzip(zip: string, dir: string): Promise<void> {
   for (const name of readdirSync(dir)) chmodSync(join(dir, name), 0o755);
 }
 
-// A server still running from an older version can't be deleted on Windows; that one goes next time.
-function prune(root: string, keep: string): void {
-  for (const name of readdirSync(root)) {
-    if (name === keep) continue;
-    try {
-      rmSync(join(root, name), { recursive: true, force: true });
-    } catch {
-      // in use
-    }
+function readJson<T>(file: string): T | undefined {
+  try {
+    return JSON.parse(readFileSync(file, 'utf8')) as T;
+  } catch {
+    return undefined;
   }
 }
 
+// "1.10.0" after "1.9.2"; anything that isn't a number ("rc1") counts as 0.
 function compareVersions(a: string, b: string): number {
-  const left = a.split('.').map(Number);
-  const right = b.split('.').map(Number);
+  const parts = (version: string) => version.split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
+  const left = parts(a);
+  const right = parts(b);
   for (let i = 0; i < Math.max(left.length, right.length); i++) {
     const diff = (left[i] ?? 0) - (right[i] ?? 0);
     if (diff !== 0) return diff;

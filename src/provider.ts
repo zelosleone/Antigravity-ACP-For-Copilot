@@ -115,7 +115,7 @@ export class AntigravityChatProvider implements vscode.LanguageModelChatProvider
     const done = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title, cancellable: true }, async (_progress, token) => {
       const cancel = token.onCancellationRequested(() => this.agent.restart());
       try {
-        await this.agent.authenticate(GOOGLE_SIGN_IN);
+        await this.agent.authenticate(await this.agent.signInMethod(GOOGLE_SIGN_IN));
         return true;
       } catch (error) {
         if (token.isCancellationRequested) return false;

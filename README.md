@@ -51,6 +51,7 @@ npm run compile   # type check + esbuild bundle
 npm run lint      # includes a complexity cap of 8
 npx -y knip       # unused files, exports and dependencies
 npm run package   # builds the .vsix
+npm run upstream  # checks Google's newest server signed out; CI runs it daily on every platform
 ```
 
 Unofficial, not affiliated with Google. Antigravity and Gemini are trademarks of Google LLC.

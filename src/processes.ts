@@ -1,23 +1,46 @@
 import { execFile, execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
+// Before servers were recorded with their name (until 0.4.1).
+const SERVER_NAME = 'agy_acp_server';
 
-/** Stops servers whose window is gone (each window records "<server pid>-<window pid>"); the name check keeps a reused pid from being hit. */
+interface Tracked {
+  file: string;
+  server: number;
+  owner: number;
+  name: string;
+  version?: string;
+}
+
+/** Records the server a window started as "<server pid>-<window pid>", with its executable and version. */
+export function trackServer(dir: string, pid: number, command: string, version: string): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${pid}-${process.pid}`), JSON.stringify({ name: basename(command, '.exe'), version }));
+}
+
+/** Stops servers whose window is gone; the name check keeps a reused pid from being hit. */
 export async function reapOrphans(dir: string): Promise<void> {
-  for (const name of existsSync(dir) ? readdirSync(dir) : []) {
-    const [server, owner] = name.split('-').map(Number);
-    if (alive(owner)) continue;
-    if (alive(server) && (await named(server, 'agy_acp_server'))) killTree(server);
-    rmSync(join(dir, name), { force: true });
+  for (const tracked of trackedServers(dir)) {
+    if (alive(tracked.owner)) continue;
+    if (alive(tracked.server) && (await named(tracked.server, tracked.name))) killTree(tracked.server);
+    rmSync(tracked.file, { force: true });
   }
 }
 
-/** Stops a closed session's harness (~130 MB), which the server itself never does, unless the pid has moved on. */
-export async function stopHarness(pid: number | undefined): Promise<void> {
-  if (!pid || !(await named(pid, 'localharness'))) return;
+/** The server versions open windows are running. */
+export function versionsInUse(dir: string): string[] {
+  return trackedServers(dir).flatMap((tracked) => (tracked.version && alive(tracked.owner) && alive(tracked.server) ? [tracked.version] : []));
+}
+
+/**
+ * Stops a closed session's harness (~130 MB), which the server itself never does, unless the pid has
+ * moved on. Never the server itself, should it ever be the one on the other end.
+ */
+export async function stopHarness(pid: number | undefined, server: number | undefined): Promise<void> {
+  if (!pid || pid === server || !(await named(pid, 'harness'))) return;
   try {
     process.kill(pid);
   } catch {
@@ -53,7 +76,23 @@ function alive(pid: number): boolean {
 
 async function named(pid: number, name: string): Promise<boolean> {
   const listing = process.platform === 'win32' ? run('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { windowsHide: true }) : run('ps', ['-p', String(pid), '-o', 'comm=']);
-  return listing.then(({ stdout }) => stdout.includes(name), () => false);
+  return listing.then(({ stdout }) => stdout.toLowerCase().includes(name.toLowerCase()), () => false);
+}
+
+function trackedServers(dir: string): Tracked[] {
+  return (existsSync(dir) ? readdirSync(dir) : []).map((file) => {
+    const [server, owner] = file.split('-').map(Number);
+    const recorded = readRecord(join(dir, file));
+    return { file: join(dir, file), server, owner, name: recorded.name || SERVER_NAME, version: recorded.version };
+  });
+}
+
+function readRecord(file: string): { name?: string; version?: string } {
+  try {
+    return JSON.parse(readFileSync(file, 'utf8')) as { name?: string; version?: string };
+  } catch {
+    return {};
+  }
 }
 
 // "TCP  127.0.0.1:57883  127.0.0.1:61234  ESTABLISHED  45180": the local address second, the pid last.

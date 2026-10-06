@@ -1,0 +1,26 @@
+name: Upstream
+
+# Every day, the extension's own download, unpacking and start code against Google's newest
+# Antigravity ACP server on each platform, signed out. A failure means a new release changed
+# something the extension relies on; GitHub emails it to the repository owner.
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+
+jobs:
+  server:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run upstream
