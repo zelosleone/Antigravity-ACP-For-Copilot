@@ -9,7 +9,7 @@ export const PERMISSION_MODES: readonly { id: PermissionMode; label: string; des
   {
     id: 'copilot',
     label: 'Copilot Tools',
-    description: "Edits and commands go through Copilot's tools; Antigravity's own are declined",
+    description: "Edits and commands go through Copilot's tools; Antigravity's own are turned off",
     note: 'Use them for edits and terminal commands: your built-in edit and command tools are turned off here.',
   },
   {
@@ -32,9 +32,21 @@ export const PERMISSION_MODES: readonly { id: PermissionMode; label: string; des
   },
 ];
 
+// Built-in tools that Copilot's own replace (edits, commands, questions, subagents), by the names the
+// server's tool filter takes.
+const REPLACED_BY_COPILOT = ['run_command', 'create_file', 'edit_file', 'ask_question', 'start_subagent'];
 const FILE_KINDS: readonly string[] = ['edit', 'delete', 'move'];
 const VERBS: Record<string, string> = { read: 'Read', edit: 'Edited', delete: 'Deleted', move: 'Moved' };
 const DETAIL_CHARS = 1200;
+
+/**
+ * The server's own filter for its built-in tools, sent when a session is created or loaded. Turned off,
+ * they also stay out of the prompt, so the model reads less and doesn't reach for them. An empty list
+ * clears what a loaded session had.
+ */
+export function toolFilter(mode: PermissionMode): { agy: { disabledTools: string[] } } {
+  return { agy: { disabledTools: mode === 'copilot' ? REPLACED_BY_COPILOT : [] } };
+}
 
 /** The answer to Antigravity's request to run one of its own tools. */
 export function decide(request: acp.RequestPermissionRequest, mode: PermissionMode, home: string): acp.RequestPermissionResponse | Promise<acp.RequestPermissionResponse> {

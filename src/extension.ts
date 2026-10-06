@@ -11,7 +11,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.lm.registerLanguageModelChatProvider('antigravity-acp', provider),
     vscode.commands.registerCommand('antigravityAcp.signIn', () => provider.signIn()),
     vscode.commands.registerCommand('antigravityAcp.manage', () => manage(provider, log)),
+    vscode.window.onDidChangeWindowState((state) => provider.focusChanged(state.focused)),
   );
+  provider.focusChanged(vscode.window.state.focused);
   provider.start();
 }
 
@@ -20,7 +22,7 @@ async function manage(provider: AntigravityChatProvider, log: vscode.LogOutputCh
     'Sign In': () => provider.signIn(),
     'Sign Out': () => provider.signOut(),
     'Refresh Models': () => provider.refresh(),
-    'Restart Server': () => provider.restart(),
+    'Restart Server': () => (provider.restart(), provider.start()),
     'Show Logs': () => log.show(),
   };
   const choice = await vscode.window.showQuickPick(Object.keys(actions), { title: provider.describe() });

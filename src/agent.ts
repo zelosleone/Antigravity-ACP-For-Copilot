@@ -1,12 +1,13 @@
-import * as acp from '@agentclientprotocol/sdk';
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import type * as acp from '@agentclientprotocol/sdk';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { Readable, Writable } from 'node:stream';
-import type { ReadableStream, WritableStream } from 'node:stream/web';
 import * as vscode from 'vscode';
+import { killTree, reapOrphans, stopHarness } from './processes.js';
+import { Connection, METHOD_NOT_FOUND, RpcError } from './rpc.js';
 import { installedServer, installServer, unpack, type Server } from './runtime.js';
 
+const PROTOCOL_VERSION = 1;
 const AUTH_REQUIRED = -32000;
 const SIGN_IN_LINK = /Open the following link to authenticate the ACP server: (https:\/\/\S+)/;
 const CANCELLED: acp.RequestPermissionResponse = { outcome: { outcome: 'cancelled' } };
@@ -43,9 +44,10 @@ export interface SessionHandler {
 
 interface Running {
   child: ChildProcess;
-  connection: acp.ClientSideConnection;
+  connection: Connection;
   server: Server;
-  exited: Promise<never>;
+  /** Whether the server can close a session itself (ACP's session/close); 1.3 can't. */
+  closes: boolean;
 }
 
 /**
@@ -74,6 +76,11 @@ export class Agent implements vscode.Disposable {
     return join(this.storage, 'home');
   }
 
+  /** Whether the server is running or starting. */
+  get started(): boolean {
+    return this.running !== undefined;
+  }
+
   /** Starts the server if it isn't running; every call below goes through here. */
   warm(): Promise<Running> {
     this.running ??= this.start().catch((error: unknown) => {
@@ -83,9 +90,9 @@ export class Agent implements vscode.Disposable {
     return this.running;
   }
 
-  async newSession(cwd: string, mcpServers: acp.McpServer[], handler: SessionHandler): Promise<acp.NewSessionResponse> {
-    const { connection, exited } = await this.warm();
-    const session = await settle(connection.newSession({ cwd, mcpServers }), exited);
+  /** `meta` carries the session's built-in tool filter. */
+  async newSession(cwd: string, mcpServers: acp.McpServer[], handler: SessionHandler, meta: object): Promise<acp.NewSessionResponse> {
+    const session = await this.request<acp.NewSessionResponse>('session/new', { cwd, mcpServers, _meta: meta });
     this.handlers.set(session.sessionId, handler);
     return session;
   }
@@ -96,54 +103,46 @@ export class Agent implements vscode.Disposable {
   }
 
   /** Reopens a saved session, after it was closed or the server restarted; Antigravity keeps its full history. */
-  async resumeSession(sessionId: string, cwd: string, mcpServers: acp.McpServer[], handler: SessionHandler): Promise<acp.ResumeSessionResponse> {
-    const { connection, exited } = await this.warm();
+  async resumeSession(sessionId: string, cwd: string, mcpServers: acp.McpServer[], handler: SessionHandler, meta: object): Promise<acp.ResumeSessionResponse> {
     this.handlers.set(sessionId, handler);
     try {
-      return await settle(connection.resumeSession({ sessionId, cwd, mcpServers }), exited);
+      return await this.request<acp.ResumeSessionResponse>('session/resume', { sessionId, cwd, mcpServers, _meta: meta });
     } catch (error) {
       this.handlers.delete(sessionId);
       throw error;
     }
   }
 
-  /** The account's models, read from a throwaway session. */
-  async models(cwd: string): Promise<ModelChoice[]> {
-    const { connection, exited } = await this.warm();
-    const session = await settle(connection.newSession({ cwd, mcpServers: [] }), exited);
-    void connection.closeSession({ sessionId: session.sessionId }).catch(() => undefined);
-    return modelOption(session.configOptions).choices;
+  prompt(sessionId: string, prompt: acp.ContentBlock[]): Promise<acp.PromptResponse> {
+    return this.request('session/prompt', { sessionId, prompt });
   }
 
-  async prompt(sessionId: string, prompt: acp.ContentBlock[]): Promise<acp.PromptResponse> {
-    const { connection, exited } = await this.warm();
-    return settle(connection.prompt({ sessionId, prompt }), exited);
+  /** Restarts the session's harness with another model; the same model again only reads the current models. */
+  async setModel(sessionId: string, model: string): Promise<ModelChoice[]> {
+    const response = await this.request<acp.SetSessionConfigOptionResponse>('session/set_config_option', { sessionId, configId: 'model', value: model });
+    return modelOption(response.configOptions).choices;
   }
 
-  async setModel(sessionId: string, model: string): Promise<void> {
-    const { connection, exited } = await this.warm();
-    await settle(connection.setSessionConfigOption({ sessionId, configId: 'model', value: model }), exited);
-  }
-
-  /** Stops whatever the session is doing and frees its harness. */
-  closeSession(sessionId: string): void {
+  /**
+   * Stops whatever the session is doing and frees its harness. A server that can't close sessions
+   * keeps every harness it started until it exits, so the session's own one is stopped instead; the
+   * server starts a new one if the session is resumed later.
+   */
+  async closeSession(sessionId: string, harness?: Promise<number | undefined>): Promise<void> {
     this.handlers.delete(sessionId);
-    const connection = this.live?.connection;
-    if (!connection) return;
-    void connection
-      .cancel({ sessionId })
-      .then(() => connection.closeSession({ sessionId }))
-      .catch(() => undefined);
+    const live = this.live;
+    if (!live) return;
+    live.connection.notify('session/cancel', { sessionId });
+    if (live.closes) await live.connection.request('session/close', { sessionId }).catch(() => undefined);
+    else await stopHarness(await harness);
   }
 
   async authenticate(methodId: string): Promise<void> {
-    const { connection, exited } = await this.warm();
-    await settle(connection.authenticate({ methodId }), exited);
+    await this.request('authenticate', { methodId });
   }
 
   async logout(): Promise<void> {
-    const { connection, exited } = await this.warm();
-    await settle(connection.logout({}), exited);
+    await this.request('logout', {});
   }
 
   /** Stops the server; the next call starts a fresh one. */
@@ -158,6 +157,16 @@ export class Agent implements vscode.Disposable {
     this.restart();
   }
 
+  // A sign-in error is marked as such.
+  private async request<T>(method: string, params: object): Promise<T> {
+    const { connection } = await this.warm();
+    try {
+      return await connection.request<T>(method, params);
+    } catch (error) {
+      throw error instanceof RpcError && error.code === AUTH_REQUIRED ? new AgentError(error.message, true) : error;
+    }
+  }
+
   private get runtimeDir(): string {
     return join(this.storage, 'runtime');
   }
@@ -167,7 +176,7 @@ export class Agent implements vscode.Disposable {
   }
 
   private async start(): Promise<Running> {
-    reapOrphans(this.pidDir);
+    await reapOrphans(this.pidDir);
     const server = installedServer(this.runtimeDir) ?? (await this.install());
     // A newer release, if any, is fetched in the background and used from the next start.
     void installServer(this.runtimeDir).catch((error: unknown) => this.log.warn(`Update check failed: ${String(error)}`));
@@ -193,26 +202,23 @@ export class Agent implements vscode.Disposable {
     mkdirSync(home, { recursive: true });
     pruneSessionData(home);
     const child = spawn(server.command, server.args, { cwd: home, env: this.env(home, server, unpacked), stdio: 'pipe', windowsHide: true });
-    const exited = new Promise<never>((_resolve, reject) => {
-      child.once('error', (error) => reject(new AgentError(`Antigravity's ACP server failed to start: ${error.message}`)));
-      child.once('exit', (code) => reject(new AgentError(`Antigravity's ACP server stopped (exit code ${code}).`)));
-    });
-    exited.catch((error: Error) => this.onExit(child, error));
+    const connection = new Connection(child, (method, params) => this.receive(method, params));
+    const exit = (error: Error) => this.onExit(child, connection, error);
+    child.once('error', (error) => exit(new AgentError(`Antigravity's ACP server failed to start: ${error.message}`)));
+    child.once('exit', (code) => exit(new AgentError(`Antigravity's ACP server stopped (exit code ${code}).`)));
     child.stderr?.setEncoding('utf8').on('data', (text: string) => this.onStderr(text));
-    const stdin = Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>;
-    const stdout = Readable.toWeb(child.stdout!) as ReadableStream<Uint8Array>;
-    const connection = new acp.ClientSideConnection(() => this.client(), acp.ndJsonStream(stdin, stdout));
     const clientInfo = { name: 'antigravity-acp-for-copilot', title: 'Antigravity for Copilot', version: this.version };
     const noLocalAccess = { fs: { readTextFile: false, writeTextFile: false }, terminal: false };
+    let initialized: acp.InitializeResponse;
     try {
-      await settle(connection.initialize({ protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: noLocalAccess, clientInfo }), exited);
+      initialized = await connection.request('initialize', { protocolVersion: PROTOCOL_VERSION, clientCapabilities: noLocalAccess, clientInfo });
     } catch (error) {
       this.stop(child);
       throw error;
     }
     this.track(child);
     this.log.info(`Antigravity ACP server ${server.version} is ready (${((Date.now() - started) / 1000).toFixed(1)} s${unpacked ? '' : ', unpacking itself'})`);
-    this.live = { child, connection, server, exited };
+    this.live = { child, connection, server, closes: Boolean(initialized.agentCapabilities?.sessionCapabilities?.close) };
     return this.live;
   }
 
@@ -242,11 +248,12 @@ export class Agent implements vscode.Disposable {
     return env;
   }
 
-  private client(): acp.Client {
-    return {
-      requestPermission: (request) => this.handlers.get(request.sessionId)?.permission(request) ?? CANCELLED,
-      sessionUpdate: ({ sessionId, update }) => this.handlers.get(sessionId)?.update(update),
-    };
+  // What the server sends the client: session updates, and permission requests it waits on.
+  private receive(method: string, params: unknown): unknown {
+    const handler = this.handlers.get((params as { sessionId?: string } | undefined)?.sessionId ?? '');
+    if (method === 'session/update') return handler?.update((params as acp.SessionNotification).update);
+    if (method === 'session/request_permission') return handler?.permission(params as acp.RequestPermissionRequest) ?? CANCELLED;
+    throw new RpcError(METHOD_NOT_FOUND, `Method not found: ${method}`);
   }
 
   private onStderr(text: string): void {
@@ -256,7 +263,8 @@ export class Agent implements vscode.Disposable {
     for (const line of text.split(/\r?\n/)) if (line.trim()) this.log.trace(line);
   }
 
-  private onExit(child: ChildProcess, error: Error): void {
+  private onExit(child: ChildProcess, connection: Connection, error: Error): void {
+    connection.close(error);
     rmSync(join(this.pidDir, `${child.pid}-${process.pid}`), { force: true });
     if (this.live?.child !== child) return;
     this.log.warn(error.message);
@@ -274,62 +282,11 @@ export class Agent implements vscode.Disposable {
     writeFileSync(join(this.pidDir, `${child.pid}-${process.pid}`), '');
   }
 
-  // Synchronous, so it is done before the extension host exits. Its harnesses go down with it.
+  // Its harnesses go down with it.
   private stop(child: ChildProcess): void {
     if (child.exitCode !== null || child.pid === undefined) return;
-    if (process.platform === 'win32') execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-    else child.kill();
+    killTree(child.pid);
     rmSync(join(this.pidDir, `${child.pid}-${process.pid}`), { force: true });
-  }
-}
-
-/** The call's result, unless the server exits first; a sign-in error is marked as such. */
-async function settle<T>(call: Promise<T>, exited: Promise<never>): Promise<T> {
-  try {
-    return await Promise.race([call, exited]);
-  } catch (error) {
-    if (error instanceof acp.RequestError && error.code === AUTH_REQUIRED) throw new AgentError(error.message, true);
-    throw error;
-  }
-}
-
-// Servers whose window is gone; the name check keeps a reused pid from being hit.
-function reapOrphans(dir: string): void {
-  for (const name of existsSync(dir) ? readdirSync(dir) : []) {
-    const [server, owner] = name.split('-').map(Number);
-    if (alive(owner)) continue;
-    if (alive(server) && isServer(server)) killQuietly(server);
-    rmSync(join(dir, name), { force: true });
-  }
-}
-
-function alive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
-
-function isServer(pid: number): boolean {
-  try {
-    const name =
-      process.platform === 'win32'
-        ? execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true })
-        : execFileSync('ps', ['-p', String(pid), '-o', 'comm='], { encoding: 'utf8' });
-    return name.includes('agy_acp_server');
-  } catch {
-    return false;
-  }
-}
-
-function killQuietly(pid: number): void {
-  try {
-    if (process.platform === 'win32') execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-    else process.kill(pid);
-  } catch {
-    // already gone
   }
 }
 

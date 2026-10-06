@@ -1,16 +1,16 @@
 import type * as acp from '@agentclientprotocol/sdk';
-import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 import { createHash, randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
 import { modelOption, type Agent, type ModelChoice, type SessionHandler } from './agent.js';
-import { errorResult, SERVER_NAME, toMcpTool, type Bridge, type BridgeEntry, type ToolHost } from './bridge.js';
+import { errorResult, SERVER_NAME, toMcpTool, type Bridge, type BridgeEntry, type CallToolResult, type Tool, type ToolHost } from './bridge.js';
 import { firstPrompt, modeNote, nonEmpty, resultsWithPrompt, toToolResult, type Block, type ChatRequest } from './convert.js';
-import { choose, decide, describe, inside, paths, type PermissionMode } from './permissions.js';
+import { choose, decide, describe, inside, paths, toolFilter, type PermissionMode } from './permissions.js';
 
 // Quiet time is measured per chat: a chat stays active while any of its sessions (its subagents and
 // side requests included) is talking to Antigravity or Copilot.
-// Finished sessions kept around for a follow-up, closed once their chat has been quiet for 10 minutes.
-const MAX_IDLE_SESSIONS = 2;
+// Each live session runs its own harness (~130 MB), so only the latest finished chat keeps one for a
+// follow-up, for 10 minutes; others resume from the server's disk in a few seconds when they come back.
+const MAX_IDLE_SESSIONS = 1;
 const IDLE_MS = 10 * 60 * 1000;
 // Nothing mid-turn is ever timed out: a reply can think for as long as it needs, and a tool call or
 // subagent can take any time. Mid-turn sessions whose chat has gone silent for 30 minutes are most
@@ -21,8 +21,14 @@ const MAX_PARKED_SESSIONS = 2;
 // a call; this only lets events already on their way land in the same response.
 const SETTLE_MS = 50;
 // Copilot ends an autopilot turn with its task_complete tool. Gemini tends to call it without having
-// written any answer, so the user sees nothing but the summary; the first such call in a turn goes back
-// to the model with this instead of to Copilot.
+// written any answer, so the user sees nothing but the summary. Each autopilot turn ends with a
+// reminder (answering first saves a round trip), and a bare call that still comes first goes back to
+// the model with UNANSWERED instead of to Copilot.
+const TASK_COMPLETE = 'task_complete';
+const REMINDER: Block = {
+  type: 'text',
+  text: '<reminder>Write your reply to the user as message text before calling vscode_task_complete; the user sees only that text.</reminder>',
+};
 const UNANSWERED =
   'Not done yet: the user has not seen any reply from you in this turn. Write your answer to the user as message text, then call task_complete again.';
 // A closed session stays on the server's disk (a week), so its chat can resume it instead of replaying.
@@ -52,7 +58,8 @@ export interface SessionContext {
   system: string;
   conversation?: string;
   log: vscode.LogOutputChannel;
-  onModels(models: ModelChoice[]): void;
+  /** The context window the server reported for a model. */
+  onWindow(model: string, size: number): void;
 }
 
 /** A Copilot tool call handed over to Copilot, waiting for its result. */
@@ -92,8 +99,10 @@ export class Session implements SessionHandler, ToolHost {
   private readonly pending = new Map<string, Pending>();
   private readonly ready: { name: string; key: string; result: CallToolResult }[] = [];
   private readonly shown = new Set<string>();
-  private usage?: { used: number; size: number };
+  private used = 0;
   private entry?: BridgeEntry;
+  /** The built-in tool filter the server applied when it opened this session. */
+  private filter = '';
   private oneShot = false;
   /** Whether this turn has shown the user any text yet, and whether a bare task_complete was sent back. */
   private answered = false;
@@ -125,7 +134,7 @@ export class Session implements SessionHandler, ToolHost {
     const saved = request.fork ? undefined : this.savedFor(request);
     if (!request.fork) this.saved.put(this.key, undefined);
     const prompt = (saved && (await this.reopen(saved, request))) || (await this.open(request));
-    await this.useModel(this.settings.model);
+    await this.adjust(false);
     // A replayed or resumed history already holds this many replies, so the next request counts on from here.
     this.responses = request.assistantCount;
     // Nothing ever follows up on a side request, so its session goes as soon as it has answered.
@@ -143,7 +152,7 @@ export class Session implements SessionHandler, ToolHost {
     this.settings = { ...settings, model: previous.model };
     if (request.results) return this.deliver(resultsWithPrompt(request.results, prompt));
     this.settings = settings;
-    await this.switchModel(settings.model, toolNames(previous.tools) !== toolNames(settings.tools));
+    await this.adjust(toolNames(previous.tools) !== toolNames(settings.tools));
     this.send(nonEmpty(prompt));
   }
 
@@ -171,7 +180,7 @@ export class Session implements SessionHandler, ToolHost {
     this.pending.clear();
     this.inbox.end();
     this.entry?.remove();
-    if (this.id) this.context.agent.closeSession(this.id);
+    if (this.id) void this.context.agent.closeSession(this.id, this.entry?.harness());
   }
 
   // ACP side: what Antigravity says and asks.
@@ -180,7 +189,7 @@ export class Session implements SessionHandler, ToolHost {
     this.lastActive = Date.now();
     if (update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text') this.reply(update.content.text);
     else if (update.sessionUpdate === 'agent_thought_chunk' && update.content.type === 'text') this.push({ type: 'thought', text: update.content.text });
-    else if (update.sessionUpdate === 'usage_update') this.usage = { used: update.used, size: update.size };
+    else if (update.sessionUpdate === 'usage_update') this.measure(update.used, update.size);
     else if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') this.showTool(update);
   }
 
@@ -214,18 +223,18 @@ export class Session implements SessionHandler, ToolHost {
     return new Promise((resolve) => this.pending.set(id, { deliver: resolve, cancel: () => resolve(errorResult('The session ended before this tool ran.')) }));
   }
 
-  // The session prepared in the background if there is one, else a new one.
+  // The session prepared in the background if there is one, even one still being made, else a new one.
   private async open(request: ChatRequest): Promise<Block[]> {
     const kind = request.fork ? 'one-off session for background compaction' : 'session';
-    const spare = this.spares.take(this.context.cwd);
+    const spare = await this.spares.take(this.context.cwd)?.catch(() => undefined);
     this.context.log.info(`${this.settings.model}: new ${kind}${spare ? ' (prepared)' : ''}, replaying ${request.history.length} earlier messages`);
     if (spare) {
       this.attach(spare.entry);
       this.context.agent.adopt(spare.id, this);
-      this.use(spare.id, spare.choices, spare.model);
+      this.use(spare.id, spare.choices, spare.model, spare.filter);
     } else {
       this.attach(await this.context.bridge.add());
-      const created = await this.context.agent.newSession(this.context.cwd, [this.entry!.server], this);
+      const created = await this.context.agent.newSession(this.context.cwd, [this.entry!.server], this, toolFilter(this.settings.mode));
       this.use(created.sessionId, ...pick(created.configOptions));
     }
     return firstPrompt(request, this.settings.mode);
@@ -235,7 +244,7 @@ export class Session implements SessionHandler, ToolHost {
   private async reopen(saved: Saved, request: ChatRequest): Promise<Block[] | undefined> {
     const entry = await this.context.bridge.add();
     try {
-      const resumed = await this.context.agent.resumeSession(saved.id, this.context.cwd, [entry.server], this);
+      const resumed = await this.context.agent.resumeSession(saved.id, this.context.cwd, [entry.server], this, toolFilter(this.settings.mode));
       this.attach(entry);
       this.use(saved.id, ...pick(resumed.configOptions));
     } catch (error) {
@@ -252,11 +261,17 @@ export class Session implements SessionHandler, ToolHost {
     entry.attach(this);
   }
 
-  private use(id: string, choices: ModelChoice[], current: string): void {
+  // Sessions are opened with the current mode's tool filter; a prepared one may have another.
+  private use(id: string, choices: ModelChoice[], current: string, filter = filterOf(this.settings.mode)): void {
     this.id = id;
     this.model = current;
     this.models = choices.map((choice) => choice.id);
-    this.context.onModels(choices);
+    this.filter = filter;
+  }
+
+  private measure(used: number, size: number): void {
+    this.used = used;
+    if (size > 0) this.context.onWindow(this.model, size);
   }
 
   private savedFor(request: ChatRequest): Saved | undefined {
@@ -280,7 +295,7 @@ export class Session implements SessionHandler, ToolHost {
   }
 
   private unanswered(tool: { name: string }): boolean {
-    return tool.name === 'task_complete' && !this.answered && !this.reminded;
+    return tool.name === TASK_COMPLETE && !this.answered && !this.reminded;
   }
 
   // Allowed, but answered here: the call's result is the reminder, so Copilot never runs it.
@@ -310,6 +325,22 @@ export class Session implements SessionHandler, ToolHost {
     }
   }
 
+  // Before a turn. The server applies a tool filter when it opens a session, so a mode with another
+  // filter reopens it, which restarts the harness as switching models does.
+  private async adjust(toolsChanged: boolean): Promise<void> {
+    if (filterOf(this.settings.mode) !== this.filter) return this.reload();
+    await this.switchModel(this.settings.model, toolsChanged);
+  }
+
+  // Resuming a session the server has open replaces its harness.
+  private async reload(): Promise<void> {
+    this.context.log.info(`Reopening the session with the tool filter for ${this.settings.mode}`);
+    const resumed = await this.context.agent.resumeSession(this.id, this.context.cwd, [this.entry!.server], this, toolFilter(this.settings.mode));
+    this.entry?.replaced();
+    this.use(this.id, ...pick(resumed.configOptions));
+    await this.useModel(this.settings.model);
+  }
+
   // Switching models restarts the harness, so it only happens between turns. The harness reads
   // Copilot's tool list when it starts, so a changed list (tools turned on or off) restarts it too,
   // by way of another model when the model itself stays the same.
@@ -321,6 +352,7 @@ export class Session implements SessionHandler, ToolHost {
   private async useModel(model: string): Promise<void> {
     if (model === this.model) return;
     await this.context.agent.setModel(this.id, model);
+    this.entry?.replaced();
     this.model = model;
   }
 
@@ -328,7 +360,8 @@ export class Session implements SessionHandler, ToolHost {
   private send(prompt: Block[]): void {
     this.answered = false;
     this.reminded = false;
-    this.context.agent.prompt(this.id, prompt).then(
+    const autopilot = this.settings.tools.some((tool) => tool.name === TASK_COMPLETE);
+    this.context.agent.prompt(this.id, autopilot ? [...prompt, REMINDER] : prompt).then(
       (response) => this.push({ type: 'end', stopReason: response.stopReason }),
       (error: unknown) => this.push({ type: 'error', error: error instanceof Error ? error : new Error(String(error)) }),
     );
@@ -361,7 +394,7 @@ export class Session implements SessionHandler, ToolHost {
     this.lastActive = Date.now();
     this.state = reply.calls.length > 0 ? 'awaiting' : 'idle';
     // Copilot reads this data part to drive its context window indicator.
-    const used = this.usage?.used ?? 0;
+    const used = this.used;
     if (used > 0) progress.report(vscode.LanguageModelDataPart.json({ prompt_tokens: used, completion_tokens: 0, total_tokens: used }, 'usage'));
     if (this.oneShot && this.state === 'idle') return this.close();
     if (this.state === 'idle') this.saved.put(this.key, { id: this.id, responses: this.responses, lastText: this.lastText, cwd: this.context.cwd, mode: this.settings.mode, at: Date.now() });
@@ -418,74 +451,115 @@ class SavedSessions {
 /** A session made ahead of time, waiting for the next new chat or subagent to take it over. */
 interface Spare {
   id: string;
-  cwd: string;
   model: string;
   choices: ModelChoice[];
   entry: BridgeEntry;
+  filter: string;
 }
 
-/** Keeps one session ready, so a new chat skips creating one (seconds) and usually switching its model. */
+interface Next {
+  cwd: string;
+  ready: Promise<Spare>;
+}
+
+/** Where the next chat will most likely work, and with what. */
+export interface SpareSetup {
+  bridge: Bridge;
+  cwd: string;
+  model?: string;
+  mode: PermissionMode;
+}
+
+/**
+ * Keeps one session ready, so a new chat skips creating one (seconds) and usually switching its model.
+ * Making it reads the account's current models from the server too. A spare is never thrown away for
+ * another mode: its harness could only be stopped once it has connected, so the chat reopens it instead.
+ */
 class Spares {
-  private spare?: Spare;
-  private preparing = false;
+  private next?: Next;
 
-  constructor(private readonly agent: Agent) {}
+  constructor(
+    private readonly agent: Agent,
+    private readonly onModels: (choices: ModelChoice[]) => void,
+  ) {}
 
-  prepare(bridge: Bridge, cwd: string, model: string | undefined, log: vscode.LogOutputChannel): void {
-    if (this.preparing || this.spare?.cwd === cwd) return;
+  /** The spare for this folder, made unless there is one; `fresh` reads the current models through it. */
+  prepare(setup: SpareSetup, fresh: boolean): Promise<Spare> {
+    if (this.next?.cwd === setup.cwd) return fresh ? this.track(this.next, this.next.ready.then((spare) => this.reread(spare))) : this.next.ready;
     this.close();
-    this.preparing = true;
-    void this.make(bridge, cwd, model)
-      .catch((error: unknown) => log.warn(`Preparing a session failed: ${String(error)}`))
-      .finally(() => (this.preparing = false));
+    const next = { cwd: setup.cwd } as Next;
+    this.next = next;
+    return this.track(next, this.make(setup, () => this.forget(next)));
   }
 
-  take(cwd: string): Spare | undefined {
-    const spare = this.spare?.cwd === cwd ? this.spare : undefined;
-    this.spare = spare ? undefined : this.spare;
-    return spare;
+  /** The spare for this folder, taken over even while it is still being made. */
+  take(cwd: string): Promise<Spare> | undefined {
+    if (this.next?.cwd !== cwd) return undefined;
+    const { ready } = this.next;
+    this.next = undefined;
+    return ready;
   }
 
   close(): void {
-    if (this.spare) this.agent.closeSession(this.spare.id);
-    this.spare?.entry.remove();
-    this.spare = undefined;
+    const next = this.next;
+    this.next = undefined;
+    void next?.ready.then((spare) => this.discard(spare), () => undefined);
   }
 
-  private async make(bridge: Bridge, cwd: string, model: string | undefined): Promise<void> {
+  // A spare that failed is forgotten, so the next chat makes its own.
+  private track(next: Next, ready: Promise<Spare>): Promise<Spare> {
+    next.ready = ready;
+    ready.catch(() => this.forget(next));
+    return ready;
+  }
+
+  private forget(next: Next): void {
+    if (this.next === next) this.next = undefined;
+  }
+
+  // Setting the model it already has restarts nothing and answers with the current models.
+  private async reread(spare: Spare): Promise<Spare> {
+    spare.choices = await this.agent.setModel(spare.id, spare.model);
+    this.onModels(spare.choices);
+    return spare;
+  }
+
+  private discard(spare: Spare): void {
+    void this.agent.closeSession(spare.id, spare.entry.harness());
+    spare.entry.remove();
+  }
+
+  // Until a chat takes it over it only waits; it is dropped if the server goes away.
+  private async make({ bridge, cwd, model, mode }: SpareSetup, gone: () => void): Promise<Spare> {
     const entry = await bridge.add();
+    const waiting: SessionHandler = { update: () => undefined, permission: async () => ({ outcome: { outcome: 'cancelled' } }), exited: gone };
     let id = '';
-    // Until a chat takes it over it only waits; it is dropped if the server goes away.
-    const waiting: SessionHandler = {
-      update: () => undefined,
-      permission: async () => ({ outcome: { outcome: 'cancelled' } }),
-      exited: () => {
-        if (this.spare?.id === id) this.spare = undefined;
-      },
-    };
     try {
-      const created = await this.agent.newSession(cwd, [entry.server], waiting);
+      const created = await this.agent.newSession(cwd, [entry.server], waiting, toolFilter(mode));
       id = created.sessionId;
       const [choices, current] = pick(created.configOptions);
-      if (model && model !== current) await this.agent.setModel(id, model);
-      this.spare = { id, cwd, model: model ?? current, choices, entry };
+      this.onModels(choices);
+      const wanted = model && choices.some((choice) => choice.id === model) ? model : current;
+      if (wanted !== current) await this.agent.setModel(id, wanted);
+      return { id, model: wanted, choices, entry, filter: filterOf(mode) };
     } catch (error) {
+      if (id) void this.agent.closeSession(id);
       entry.remove();
       throw error;
     }
   }
 }
 
-/** Live conversations, most recent first. Each runs its own harness (~90 MB), so keep few. */
+/** Live conversations, most recent first. Each runs its own harness (~130 MB), so keep few. */
 export class Sessions implements vscode.Disposable {
   private sessions: Session[] = [];
   private readonly saved: SavedSessions;
   private readonly spares: Spares;
   private readonly timer = setInterval(() => this.sweep(), 60_000);
 
-  constructor(memento: vscode.Memento, agent: Agent) {
+  constructor(memento: vscode.Memento, agent: Agent, onModels: (choices: ModelChoice[]) => void) {
     this.saved = new SavedSessions(memento);
-    this.spares = new Spares(agent);
+    this.spares = new Spares(agent, onModels);
     this.timer.unref();
   }
 
@@ -503,13 +577,21 @@ export class Sessions implements vscode.Disposable {
       session.close();
       throw error;
     }
-    this.prepare(context.bridge, context.cwd, settings.model, context.log);
+    const setup = { bridge: context.bridge, cwd: context.cwd, model: settings.model, mode: settings.mode };
+    this.prepare(setup).catch((error: unknown) => context.log.warn(`Preparing a session failed: ${String(error)}`));
     return session;
   }
 
-  /** Makes a session ahead of time for the next new chat. */
-  prepare(bridge: Bridge, cwd: string, model: string | undefined, log: vscode.LogOutputChannel): void {
-    this.spares.prepare(bridge, cwd, model, log);
+  /** Makes a session ahead of time for the next new chat; `fresh` reads the current models through one already made. */
+  async prepare(setup: SpareSetup, fresh = false): Promise<void> {
+    await this.spares.prepare(setup, fresh);
+  }
+
+  /** Whether a chat is mid-turn: replying, or waiting on a Copilot tool that may still be running. */
+  running(): boolean {
+    const now = Date.now();
+    const chats = chatActivity(this.sessions);
+    return this.sessions.some((session) => session.state === 'busy' || (session.state === 'awaiting' && quietMs(session, chats, now) < PARKED_MS));
   }
 
   closeAll(): void {
@@ -529,10 +611,10 @@ export class Sessions implements vscode.Disposable {
     let idle = 0;
     let parked = 0;
     for (const session of this.sessions) {
-      const quietMs = now - (chats.get(session.conversation) ?? session.lastActive);
+      const quiet = quietMs(session, chats, now);
       if (session.state === 'idle') idle++;
-      if (session.state === 'awaiting' && quietMs > PARKED_MS) parked++;
-      if (expired(session.state, quietMs, idle, parked)) session.close();
+      if (session.state === 'awaiting' && quiet > PARKED_MS) parked++;
+      if (expired(session.state, quiet, idle, parked)) session.close();
     }
     this.sessions = this.sessions.filter((session) => session.state !== 'closed');
   }
@@ -584,6 +666,14 @@ function chatActivity(sessions: Session[]): Map<string | undefined, number> {
     if (conversation) chats.set(conversation, Math.max(chats.get(conversation) ?? 0, lastActive));
   }
   return chats;
+}
+
+function quietMs(session: Session, chats: Map<string | undefined, number>, now: number): number {
+  return now - (chats.get(session.conversation) ?? session.lastActive);
+}
+
+function filterOf(mode: PermissionMode): string {
+  return JSON.stringify(toolFilter(mode));
 }
 
 // Ranks count finished and parked sessions, most recent first. Busy sessions are never closed here.

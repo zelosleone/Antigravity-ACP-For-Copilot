@@ -1,6 +1,6 @@
 import type { ContentBlock } from '@agentclientprotocol/sdk';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import * as vscode from 'vscode';
+import type { CallToolResult } from './bridge.js';
 import { PERMISSION_MODES, type PermissionMode } from './permissions.js';
 
 export type Block = Extract<ContentBlock, { type: 'text' | 'image' }>;
