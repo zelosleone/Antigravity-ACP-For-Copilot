@@ -3,7 +3,7 @@ import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 import { createHash, randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
 import { modelOption, type Agent, type ModelChoice, type SessionHandler } from './agent.js';
-import { errorResult, SERVER_NAME, toMcpTool, type Bridge, type ToolHost } from './bridge.js';
+import { errorResult, SERVER_NAME, toMcpTool, type Bridge, type BridgeEntry, type ToolHost } from './bridge.js';
 import { firstPrompt, modeNote, nonEmpty, resultsWithPrompt, toToolResult, type Block, type ChatRequest } from './convert.js';
 import { choose, decide, describe, inside, paths, type PermissionMode } from './permissions.js';
 
@@ -20,6 +20,11 @@ const MAX_PARKED_SESSIONS = 2;
 // Antigravity waits on a tool's permission until Copilot has run it, so nothing more can arrive after
 // a call; this only lets events already on their way land in the same response.
 const SETTLE_MS = 50;
+// Copilot ends an autopilot turn with its task_complete tool. Gemini tends to call it without having
+// written any answer, so the user sees nothing but the summary; the first such call in a turn goes back
+// to the model with this instead of to Copilot.
+const UNANSWERED =
+  'Not done yet: the user has not seen any reply from you in this turn. Write your answer to the user as message text, then call task_complete again.';
 // A closed session stays on the server's disk (a week), so its chat can resume it instead of replaying.
 const SAVED_KEY = 'antigravityAcp.savedSessions';
 const SAVED_MS = 7 * 24 * 60 * 60 * 1000;
@@ -88,13 +93,17 @@ export class Session implements SessionHandler, ToolHost {
   private readonly ready: { name: string; key: string; result: CallToolResult }[] = [];
   private readonly shown = new Set<string>();
   private usage?: { used: number; size: number };
-  private removeTools?: () => void;
+  private entry?: BridgeEntry;
   private oneShot = false;
+  /** Whether this turn has shown the user any text yet, and whether a bare task_complete was sent back. */
+  private answered = false;
+  private reminded = false;
 
   constructor(
     private readonly context: SessionContext,
     settings: SessionSettings,
     private readonly saved: SavedSessions,
+    private readonly spares: Spares,
   ) {
     this.settings = settings;
     // A chat's subagents share its id but not its system prompt.
@@ -111,13 +120,11 @@ export class Session implements SessionHandler, ToolHost {
     return request.results ? this.awaits(request) : this.idleAfter(request);
   }
 
-  /** Resumes the session this chat finished its last reply in, if the server kept it; else starts one that replays the history. */
+  /** Resumes the session this chat finished its last reply in, if the server kept it; else opens one that replays the history. */
   async begin(request: ChatRequest): Promise<void> {
-    const { server, remove } = await this.context.bridge.add(this);
-    this.removeTools = remove;
     const saved = request.fork ? undefined : this.savedFor(request);
     if (!request.fork) this.saved.put(this.key, undefined);
-    const prompt = (saved && (await this.reopen(saved, request, server))) || (await this.create(request, server));
+    const prompt = (saved && (await this.reopen(saved, request))) || (await this.open(request));
     await this.useModel(this.settings.model);
     // A replayed or resumed history already holds this many replies, so the next request counts on from here.
     this.responses = request.assistantCount;
@@ -163,7 +170,7 @@ export class Session implements SessionHandler, ToolHost {
     for (const pending of this.pending.values()) pending.cancel();
     this.pending.clear();
     this.inbox.end();
-    this.removeTools?.();
+    this.entry?.remove();
     if (this.id) this.context.agent.closeSession(this.id);
   }
 
@@ -171,7 +178,7 @@ export class Session implements SessionHandler, ToolHost {
 
   update(update: acp.SessionUpdate): void {
     this.lastActive = Date.now();
-    if (update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text') this.push({ type: 'text', text: update.content.text });
+    if (update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text') this.reply(update.content.text);
     else if (update.sessionUpdate === 'agent_thought_chunk' && update.content.type === 'text') this.push({ type: 'thought', text: update.content.text });
     else if (update.sessionUpdate === 'usage_update') this.usage = { used: update.used, size: update.size };
     else if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') this.showTool(update);
@@ -180,6 +187,7 @@ export class Session implements SessionHandler, ToolHost {
   permission(request: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
     this.lastActive = Date.now();
     const tool = copilotTool(request.toolCall);
+    if (tool && this.unanswered(tool)) return Promise.resolve(this.remind(request, tool));
     if (tool) return this.handOver(request, tool);
     this.context.log.info(`Antigravity's own tool (${this.settings.mode}): ${request.toolCall.title ?? 'unknown'}`);
     return Promise.resolve(decide(request, this.settings.mode, this.context.agent.home));
@@ -206,20 +214,32 @@ export class Session implements SessionHandler, ToolHost {
     return new Promise((resolve) => this.pending.set(id, { deliver: resolve, cancel: () => resolve(errorResult('The session ended before this tool ran.')) }));
   }
 
-  private async create(request: ChatRequest, server: acp.McpServer): Promise<Block[]> {
+  // The session prepared in the background if there is one, else a new one.
+  private async open(request: ChatRequest): Promise<Block[]> {
     const kind = request.fork ? 'one-off session for background compaction' : 'session';
-    this.context.log.info(`${this.settings.model}: new ${kind}, replaying ${request.history.length} earlier messages`);
-    const created = await this.context.agent.newSession(this.context.cwd, [server], this);
-    this.adopt(created.sessionId, created.configOptions);
+    const spare = this.spares.take(this.context.cwd);
+    this.context.log.info(`${this.settings.model}: new ${kind}${spare ? ' (prepared)' : ''}, replaying ${request.history.length} earlier messages`);
+    if (spare) {
+      this.attach(spare.entry);
+      this.context.agent.adopt(spare.id, this);
+      this.use(spare.id, spare.choices, spare.model);
+    } else {
+      this.attach(await this.context.bridge.add());
+      const created = await this.context.agent.newSession(this.context.cwd, [this.entry!.server], this);
+      this.use(created.sessionId, ...pick(created.configOptions));
+    }
     return firstPrompt(request, this.settings.mode);
   }
 
   // Undefined when the server no longer has the session; a new one replays the history instead.
-  private async reopen(saved: Saved, request: ChatRequest, server: acp.McpServer): Promise<Block[] | undefined> {
+  private async reopen(saved: Saved, request: ChatRequest): Promise<Block[] | undefined> {
+    const entry = await this.context.bridge.add();
     try {
-      const resumed = await this.context.agent.resumeSession(saved.id, this.context.cwd, [server], this);
-      this.adopt(saved.id, resumed.configOptions);
+      const resumed = await this.context.agent.resumeSession(saved.id, this.context.cwd, [entry.server], this);
+      this.attach(entry);
+      this.use(saved.id, ...pick(resumed.configOptions));
     } catch (error) {
+      entry.remove();
       this.context.log.warn(`Saved session ${saved.id} could not be resumed: ${String(error)}`);
       return undefined;
     }
@@ -227,10 +247,14 @@ export class Session implements SessionHandler, ToolHost {
     return nonEmpty([...(saved.mode === this.settings.mode ? [] : [modeNote(this.settings.mode)]), ...request.prompt]);
   }
 
-  private adopt(id: string, options: acp.SessionConfigOption[] | null | undefined): void {
+  private attach(entry: BridgeEntry): void {
+    this.entry = entry;
+    entry.attach(this);
+  }
+
+  private use(id: string, choices: ModelChoice[], current: string): void {
     this.id = id;
-    const { choices, current } = modelOption(options);
-    this.model = current ?? '';
+    this.model = current;
     this.models = choices.map((choice) => choice.id);
     this.context.onModels(choices);
   }
@@ -248,6 +272,23 @@ export class Session implements SessionHandler, ToolHost {
     // Its plans, task lists and notes in its own home are internal.
     if (paths(call).some((path) => inside(this.context.agent.home, path))) return;
     this.push({ type: 'text', text: `\n\n> ${describe(call, this.context.cwd)}\n\n` });
+  }
+
+  private reply(text: string): void {
+    if (text.trim()) this.answered = true;
+    this.push({ type: 'text', text });
+  }
+
+  private unanswered(tool: { name: string }): boolean {
+    return tool.name === 'task_complete' && !this.answered && !this.reminded;
+  }
+
+  // Allowed, but answered here: the call's result is the reminder, so Copilot never runs it.
+  private remind(request: acp.RequestPermissionRequest, tool: { name: string; input: Record<string, unknown> }): acp.RequestPermissionResponse {
+    this.reminded = true;
+    this.context.log.info('task_complete came before any answer; asking for the answer first');
+    this.ready.push({ name: tool.name, key: keyOf(tool.input), result: errorResult(UNANSWERED) });
+    return choose(request, 'allow_once');
   }
 
   private handOver(request: acp.RequestPermissionRequest, tool: { name: string; input: Record<string, unknown> }): Promise<acp.RequestPermissionResponse> {
@@ -283,7 +324,10 @@ export class Session implements SessionHandler, ToolHost {
     this.model = model;
   }
 
+  // A new turn: the user has seen nothing of it yet.
   private send(prompt: Block[]): void {
+    this.answered = false;
+    this.reminded = false;
     this.context.agent.prompt(this.id, prompt).then(
       (response) => this.push({ type: 'end', stopReason: response.stopReason }),
       (error: unknown) => this.push({ type: 'error', error: error instanceof Error ? error : new Error(String(error)) }),
@@ -371,21 +415,84 @@ class SavedSessions {
   }
 }
 
+/** A session made ahead of time, waiting for the next new chat or subagent to take it over. */
+interface Spare {
+  id: string;
+  cwd: string;
+  model: string;
+  choices: ModelChoice[];
+  entry: BridgeEntry;
+}
+
+/** Keeps one session ready, so a new chat skips creating one (seconds) and usually switching its model. */
+class Spares {
+  private spare?: Spare;
+  private preparing = false;
+
+  constructor(private readonly agent: Agent) {}
+
+  prepare(bridge: Bridge, cwd: string, model: string | undefined, log: vscode.LogOutputChannel): void {
+    if (this.preparing || this.spare?.cwd === cwd) return;
+    this.close();
+    this.preparing = true;
+    void this.make(bridge, cwd, model)
+      .catch((error: unknown) => log.warn(`Preparing a session failed: ${String(error)}`))
+      .finally(() => (this.preparing = false));
+  }
+
+  take(cwd: string): Spare | undefined {
+    const spare = this.spare?.cwd === cwd ? this.spare : undefined;
+    this.spare = spare ? undefined : this.spare;
+    return spare;
+  }
+
+  close(): void {
+    if (this.spare) this.agent.closeSession(this.spare.id);
+    this.spare?.entry.remove();
+    this.spare = undefined;
+  }
+
+  private async make(bridge: Bridge, cwd: string, model: string | undefined): Promise<void> {
+    const entry = await bridge.add();
+    let id = '';
+    // Until a chat takes it over it only waits; it is dropped if the server goes away.
+    const waiting: SessionHandler = {
+      update: () => undefined,
+      permission: async () => ({ outcome: { outcome: 'cancelled' } }),
+      exited: () => {
+        if (this.spare?.id === id) this.spare = undefined;
+      },
+    };
+    try {
+      const created = await this.agent.newSession(cwd, [entry.server], waiting);
+      id = created.sessionId;
+      const [choices, current] = pick(created.configOptions);
+      if (model && model !== current) await this.agent.setModel(id, model);
+      this.spare = { id, cwd, model: model ?? current, choices, entry };
+    } catch (error) {
+      entry.remove();
+      throw error;
+    }
+  }
+}
+
 /** Live conversations, most recent first. Each runs its own harness (~90 MB), so keep few. */
 export class Sessions implements vscode.Disposable {
   private sessions: Session[] = [];
   private readonly saved: SavedSessions;
+  private readonly spares: Spares;
   private readonly timer = setInterval(() => this.sweep(), 60_000);
 
-  constructor(memento: vscode.Memento) {
+  constructor(memento: vscode.Memento, agent: Agent) {
     this.saved = new SavedSessions(memento);
+    this.spares = new Spares(agent);
     this.timer.unref();
   }
 
-  /** Continues the live session that holds this conversation, or opens one (resumed or replayed). */
+  /** Continues the live session that holds this conversation, or opens one (resumed, prepared or new). */
   async open(request: ChatRequest, settings: SessionSettings, context: SessionContext): Promise<Session> {
     const live = this.sessions.find((session) => session.continues(request, context.conversation));
-    const session = live ?? new Session(context, settings, this.saved);
+    const session = live ?? new Session(context, settings, this.saved, this.spares);
     // Both mark the session busy before their first await, so the sweep below spares it.
     const ready = live ? live.resume(request, settings) : session.begin(request);
     this.sessions = [session, ...this.sessions.filter((other) => other !== session)];
@@ -396,12 +503,19 @@ export class Sessions implements vscode.Disposable {
       session.close();
       throw error;
     }
+    this.prepare(context.bridge, context.cwd, settings.model, context.log);
     return session;
+  }
+
+  /** Makes a session ahead of time for the next new chat. */
+  prepare(bridge: Bridge, cwd: string, model: string | undefined, log: vscode.LogOutputChannel): void {
+    this.spares.prepare(bridge, cwd, model, log);
   }
 
   closeAll(): void {
     for (const session of this.sessions) session.close();
     this.sessions = [];
+    this.spares.close();
   }
 
   dispose(): void {
@@ -450,6 +564,11 @@ class Inbox<T> {
     }
     return this.items.shift();
   }
+}
+
+function pick(options: acp.SessionConfigOption[] | null | undefined): [ModelChoice[], string] {
+  const { choices, current } = modelOption(options);
+  return [choices, current ?? ''];
 }
 
 // Gemini's thinking, where VS Code offers a part for it (not yet in the stable typings).

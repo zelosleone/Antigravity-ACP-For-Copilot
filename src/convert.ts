@@ -91,7 +91,9 @@ function instructions(system: string, mode: PermissionMode): string {
   return [
     '<copilot_instructions>',
     'You are the model behind GitHub Copilot Chat in VS Code. The instructions below come from Copilot and take ' +
-      `precedence over your defaults. Copilot's tools are available to you with a vscode_ prefix (Copilot's read_file is vscode_read_file). ${note}`,
+      `precedence over your defaults. Copilot's tools are available to you with a vscode_ prefix (Copilot's read_file is vscode_read_file). ${note} ` +
+      'Write your answer to the user as message text, since that is all they see of it: a tool such as vscode_task_complete never replaces it, ' +
+      'and a plain question or greeting gets a plain reply.',
     system,
     '</copilot_instructions>',
   ].join('\n\n');

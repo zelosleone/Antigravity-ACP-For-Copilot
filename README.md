@@ -1,9 +1,15 @@
 # Antigravity for Copilot
 
-Use your Google Antigravity models (Gemini 3.8 Flash, Gemini 3.1 Pro and the rest of your account's catalog) in GitHub Copilot Chat. Requests go through Google's official Antigravity ACP server, the same one Zed and JetBrains install from the [ACP registry](https://agentclientprotocol.com/get-started/registry), running unmodified on your machine. Sign-in happens on Google's own page and the server keeps the tokens; this extension never sees them.
+Use your Google Antigravity plan's Gemini models (Gemini 3.8 Flash, Gemini 3.1 Pro and the rest of your account's catalog) in GitHub Copilot Chat. Requests go through Google's official Antigravity ACP server, the same one Zed and JetBrains install from the [ACP registry](https://agentclientprotocol.com/get-started/registry), running unmodified on your machine. You sign in with Google on Google's own page and the server keeps the tokens; this extension never sees them.
 
-1. Pick an Antigravity model in the Copilot Chat model picker. The first time, the extension downloads the server (about 125 MB) and asks you to sign in. **Antigravity: Sign In** offers every method the server has: Google account, Gemini Enterprise, Gemini API key or Vertex AI key.
+1. Pick an Antigravity model in the Copilot Chat model picker. The first time, the extension downloads the server (about 125 MB) and asks you to sign in with Google.
 2. Next to the model, pick the thinking effort and the permissions.
+
+The server only offers its Claude and GPT-OSS models to clients it recognizes (Zed, JetBrains, Xcode), so Copilot gets the Gemini ones.
+
+## Fast starts
+
+Google's server is a PyInstaller one-file build that unpacks about 8,000 files into a new temp folder every time it starts, which takes half a minute. The extension unpacks them once per server version and starts the unchanged executable in PyInstaller's own already-unpacked mode, so the server is up in a few seconds. A session is also made ahead of time with your last model, so a new chat (or a subagent) starts without waiting for one. If a window crashes and leaves its server behind, the next start stops it.
 
 ## Permissions
 
@@ -18,9 +24,11 @@ What it runs itself shows up in the chat (`> Ran npm test`, `> Edited src/app.ts
 
 ## Sessions
 
-Every tool call waits for Copilot's result however long it takes: Antigravity's own three-minute limit on tool calls doesn't apply, because the call is held at its permission step rather than on the wire. The server takes half a minute or more to start (it unpacks itself on every launch), so one process stays warm per window and every chat is a session in it. A finished chat keeps its live session for 10 minutes (two at most); a running agent keeps it for as long as it takes. The server saves sessions for a week, so a chat that comes back later, even after a reload, resumes exactly where it was. Only when the history no longer lines up (an edited message, summarization) does a new session replay it as a transcript. The server runs with its own Antigravity home, so your global Antigravity MCP servers, rules and skills stay out of Copilot's chats.
+Every tool call waits for Copilot's result however long it takes: Antigravity's own three-minute limit on tool calls doesn't apply, because the call is held at its permission step rather than on the wire. One server process runs per window and every chat is a session in it. A finished chat keeps its live session for 10 minutes (two at most); a running agent keeps it for as long as it takes. The server saves sessions for a week, so a chat that comes back later, even after a reload, resumes exactly where it was. Only when the history no longer lines up (an edited message, summarization) does a new session replay it as a transcript. The server runs with its own Antigravity home, so your global Antigravity MCP servers, rules and skills stay out of Copilot's chats.
 
-This is for using your own account for your own work. Google's [Antigravity terms](https://antigravity.google/terms) forbid using the service through third-party software that reuses its credentials; a Google moderator has said that running the official, unmodified binaries locally for a single user, with sign-in kept inside them, is supported, and points ACP editor integrations to this server. Don't run it as a shared service, and sign in with an API key if you want to stay clear of the question entirely.
+In autopilot, Copilot ends a turn with its `task_complete` tool. Gemini tends to call it without writing any answer, so the first such call in a turn is sent back with a reminder to answer first.
+
+This is for using your own account for your own work. Google's [Antigravity terms](https://antigravity.google/terms) forbid using the service through third-party software that reuses its credentials; a Google moderator has said that running the official, unmodified binaries locally for a single user, with sign-in kept inside them, is supported, and points ACP editor integrations to this server. Don't run it as a shared service.
 
 ## Development
 

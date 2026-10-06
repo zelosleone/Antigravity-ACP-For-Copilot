@@ -1,11 +1,11 @@
 import * as acp from '@agentclientprotocol/sdk';
-import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import type { ReadableStream, WritableStream } from 'node:stream/web';
 import * as vscode from 'vscode';
-import { installedServer, installServer, type Server } from './runtime.js';
+import { installedServer, installServer, unpack, type Server } from './runtime.js';
 
 const AUTH_REQUIRED = -32000;
 const SIGN_IN_LINK = /Open the following link to authenticate the ACP server: (https:\/\/\S+)/;
@@ -49,8 +49,8 @@ interface Running {
 }
 
 /**
- * Google's ACP server, shared by every chat. It unpacks itself on each launch, which takes half a
- * minute or more, so one warm process hosts all sessions; each session runs its own harness in it.
+ * Google's ACP server, shared by every chat in this window; each session runs its own harness in it.
+ * Launched from its unpacked files it is ready in seconds, and one warm process serves all chats.
  */
 export class Agent implements vscode.Disposable {
   private running?: Promise<Running>;
@@ -61,7 +61,8 @@ export class Agent implements vscode.Disposable {
     private readonly storage: string,
     private readonly version: string,
     private readonly log: vscode.LogOutputChannel,
-    private readonly extraEnv: () => Promise<Record<string, string>>,
+    /** The model new sessions open with, so they skip a switch (which restarts the harness). */
+    private readonly defaultModel: () => string | undefined,
   ) {}
 
   get serverVersion(): string | undefined {
@@ -87,6 +88,11 @@ export class Agent implements vscode.Disposable {
     const session = await settle(connection.newSession({ cwd, mcpServers }), exited);
     this.handlers.set(session.sessionId, handler);
     return session;
+  }
+
+  /** Hands a prepared session to the chat that takes it over. */
+  adopt(sessionId: string, handler: SessionHandler): void {
+    this.handlers.set(sessionId, handler);
   }
 
   /** Reopens a saved session, after it was closed or the server restarted; Antigravity keeps its full history. */
@@ -140,12 +146,12 @@ export class Agent implements vscode.Disposable {
     await settle(connection.logout({}), exited);
   }
 
-  /** Stops the server; the next call starts a fresh one with the current environment. */
+  /** Stops the server; the next call starts a fresh one. */
   restart(): void {
     const child = this.live?.child;
     this.live = undefined;
     this.running = undefined;
-    if (child) killTree(child);
+    if (child) this.stop(child);
   }
 
   dispose(): void {
@@ -156,14 +162,37 @@ export class Agent implements vscode.Disposable {
     return join(this.storage, 'runtime');
   }
 
+  private get pidDir(): string {
+    return join(this.storage, 'servers');
+  }
+
   private async start(): Promise<Running> {
+    reapOrphans(this.pidDir);
     const server = installedServer(this.runtimeDir) ?? (await this.install());
     // A newer release, if any, is fetched in the background and used from the next start.
     void installServer(this.runtimeDir).catch((error: unknown) => this.log.warn(`Update check failed: ${String(error)}`));
+    const unpacked = await this.unpacked(server);
+    try {
+      return await this.launch(server, unpacked);
+    } catch (error) {
+      if (!unpacked) throw error;
+      this.log.warn(`Fast start failed, starting the usual way: ${String(error)}`);
+      return this.launch(server, undefined);
+    }
+  }
+
+  private async unpacked(server: Server): Promise<string | undefined> {
+    const title = "Preparing Antigravity's server for fast starts";
+    const work = () => unpack(server).catch((error: unknown) => void this.log.warn(`Unpacking failed: ${String(error)}`));
+    return vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title }, work);
+  }
+
+  private async launch(server: Server, unpacked: string | undefined): Promise<Running> {
+    const started = Date.now();
     const home = this.home;
     mkdirSync(home, { recursive: true });
     pruneSessionData(home);
-    const child = spawn(server.command, server.args, { cwd: home, env: await this.env(home), stdio: 'pipe', windowsHide: true });
+    const child = spawn(server.command, server.args, { cwd: home, env: this.env(home, server, unpacked), stdio: 'pipe', windowsHide: true });
     const exited = new Promise<never>((_resolve, reject) => {
       child.once('error', (error) => reject(new AgentError(`Antigravity's ACP server failed to start: ${error.message}`)));
       child.once('exit', (code) => reject(new AgentError(`Antigravity's ACP server stopped (exit code ${code}).`)));
@@ -178,10 +207,11 @@ export class Agent implements vscode.Disposable {
     try {
       await settle(connection.initialize({ protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: noLocalAccess, clientInfo }), exited);
     } catch (error) {
-      killTree(child);
+      this.stop(child);
       throw error;
     }
-    this.log.info(`Antigravity ACP server ${server.version} is ready`);
+    this.track(child);
+    this.log.info(`Antigravity ACP server ${server.version} is ready (${((Date.now() - started) / 1000).toFixed(1)} s${unpacked ? '' : ', unpacking itself'})`);
     this.live = { child, connection, server, exited };
     return this.live;
   }
@@ -200,11 +230,15 @@ export class Agent implements vscode.Disposable {
 
   // Its own home keeps the user's global Antigravity MCP servers, rules and skills out of Copilot's
   // chats; Copilot passes its own. A Python setup from the editor's environment would leak into the
-  // server's bundled Python.
-  private async env(home: string): Promise<NodeJS.ProcessEnv> {
-    const env: NodeJS.ProcessEnv = { ...process.env, ...(await this.extraEnv()), GEMINI_HOME: home };
+  // server's bundled Python. With its files unpacked, PyInstaller's own variables point the
+  // unchanged executable at them instead of a fresh temp folder.
+  private env(home: string, server: Server, unpacked: string | undefined): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...process.env, GEMINI_HOME: home };
     delete env.PYTHONHOME;
     delete env.PYTHONPATH;
+    const model = this.defaultModel();
+    if (model) env.AGY_ACP_DEFAULT_MODEL = model;
+    if (unpacked) Object.assign(env, { _PYI_PARENT_PROCESS_LEVEL: '0', _PYI_APPLICATION_HOME_DIR: unpacked, _PYI_ARCHIVE_FILE: server.command });
     return env;
   }
 
@@ -223,6 +257,7 @@ export class Agent implements vscode.Disposable {
   }
 
   private onExit(child: ChildProcess, error: Error): void {
+    rmSync(join(this.pidDir, `${child.pid}-${process.pid}`), { force: true });
     if (this.live?.child !== child) return;
     this.log.warn(error.message);
     this.live = undefined;
@@ -230,6 +265,71 @@ export class Agent implements vscode.Disposable {
     const handlers = [...this.handlers.values()];
     this.handlers.clear();
     for (const handler of handlers) handler.exited(error);
+  }
+
+  // The server ignores a closed stdin, so a crashed editor would leave it running; each window
+  // records the server it started (server pid, window pid) and the next start stops orphans.
+  private track(child: ChildProcess): void {
+    mkdirSync(this.pidDir, { recursive: true });
+    writeFileSync(join(this.pidDir, `${child.pid}-${process.pid}`), '');
+  }
+
+  // Synchronous, so it is done before the extension host exits. Its harnesses go down with it.
+  private stop(child: ChildProcess): void {
+    if (child.exitCode !== null || child.pid === undefined) return;
+    if (process.platform === 'win32') execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+    else child.kill();
+    rmSync(join(this.pidDir, `${child.pid}-${process.pid}`), { force: true });
+  }
+}
+
+/** The call's result, unless the server exits first; a sign-in error is marked as such. */
+async function settle<T>(call: Promise<T>, exited: Promise<never>): Promise<T> {
+  try {
+    return await Promise.race([call, exited]);
+  } catch (error) {
+    if (error instanceof acp.RequestError && error.code === AUTH_REQUIRED) throw new AgentError(error.message, true);
+    throw error;
+  }
+}
+
+// Servers whose window is gone; the name check keeps a reused pid from being hit.
+function reapOrphans(dir: string): void {
+  for (const name of existsSync(dir) ? readdirSync(dir) : []) {
+    const [server, owner] = name.split('-').map(Number);
+    if (alive(owner)) continue;
+    if (alive(server) && isServer(server)) killQuietly(server);
+    rmSync(join(dir, name), { force: true });
+  }
+}
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function isServer(pid: number): boolean {
+  try {
+    const name =
+      process.platform === 'win32'
+        ? execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true })
+        : execFileSync('ps', ['-p', String(pid), '-o', 'comm='], { encoding: 'utf8' });
+    return name.includes('agy_acp_server');
+  } catch {
+    return false;
+  }
+}
+
+function killQuietly(pid: number): void {
+  try {
+    if (process.platform === 'win32') execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+    else process.kill(pid);
+  } catch {
+    // already gone
   }
 }
 
@@ -246,21 +346,4 @@ function pruneSessionData(home: string): void {
       }
     }
   }
-}
-
-/** The call's result, unless the server exits first; a sign-in error is marked as such. */
-async function settle<T>(call: Promise<T>, exited: Promise<never>): Promise<T> {
-  try {
-    return await Promise.race([call, exited]);
-  } catch (error) {
-    if (error instanceof acp.RequestError && error.code === AUTH_REQUIRED) throw new AgentError(error.message, true);
-    throw error;
-  }
-}
-
-// The server is a self-unpacking bundle whose real process is a child of the one we start.
-function killTree(child: ChildProcess): void {
-  if (child.exitCode !== null || child.pid === undefined) return;
-  if (process.platform === 'win32') spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-  else child.kill();
 }

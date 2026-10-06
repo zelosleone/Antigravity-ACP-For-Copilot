@@ -17,7 +17,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
 async function manage(provider: AntigravityChatProvider, log: vscode.LogOutputChannel): Promise<void> {
   const actions: Record<string, () => unknown> = {
-    'Sign In...': () => provider.signIn(),
+    'Sign In': () => provider.signIn(),
     'Sign Out': () => provider.signOut(),
     'Refresh Models': () => provider.refresh(),
     'Restart Server': () => provider.restart(),

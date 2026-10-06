@@ -1,10 +1,12 @@
 import { execFile } from 'node:child_process';
 import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdir, open, rename, rm, writeFile, type FileHandle } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { ReadableStream } from 'node:stream/web';
 import { promisify } from 'node:util';
+import { inflate } from 'node:zlib';
 
 // Google publishes its ACP server through the ACP registry, the same source Zed and JetBrains install from.
 const REGISTRY = 'https://raw.githubusercontent.com/agentclientprotocol/registry/main/antigravity-acp/agent.json';
@@ -19,6 +21,15 @@ const PLATFORMS: Record<string, string> = {
 };
 const MARKER = 'server.json';
 const run = promisify(execFile);
+const inflateAsync = promisify(inflate);
+// The server is a PyInstaller one-file build: on every launch it unpacks ~8,000 files into a fresh temp
+// folder, which takes half a minute with antivirus scanning. Unpacked once, the unchanged executable
+// runs from them in PyInstaller's own already-unpacked mode, which wants a name of the form _MEI +
+// 8 hex digits + suffix (18 characters on POSIX).
+const UNPACKED = '_MEI00000000agyacp';
+const COOKIE = Buffer.from([0x4d, 0x45, 0x49, 0x0c, 0x0b, 0x0a, 0x0b, 0x0e]);
+const COOKIE_SIZE = 88;
+const UNPACKED_TYPES = 'bxZ';
 
 export interface Server {
   version: string;
@@ -63,6 +74,56 @@ export async function installServer(root: string, onProgress?: (fraction: number
   writeFileSync(marker, JSON.stringify(server));
   prune(root, entry.version);
   return server;
+}
+
+/** The folder holding the server's unpacked files, unpacking them first if needed; undefined if it isn't a PyInstaller build. */
+export async function unpack(server: Server): Promise<string | undefined> {
+  const dir = join(dirname(server.command), UNPACKED);
+  if (existsSync(dir)) return dir;
+  // Another window may be unpacking at the same time; whichever finishes first wins.
+  const partial = `${dir}.${process.pid}`;
+  await rm(partial, { recursive: true, force: true });
+  const file = await open(server.command, 'r');
+  try {
+    if (!(await unpackArchive(file, partial))) return undefined;
+  } finally {
+    await file.close();
+  }
+  await rename(partial, dir).catch(() => rm(partial, { recursive: true, force: true }));
+  return dir;
+}
+
+// The PyInstaller archive sits at the end of the executable, located by its cookie; its table of
+// contents lists every bundled file, and the ones the bootloader would unpack are written out.
+async function unpackArchive(file: FileHandle, out: string): Promise<boolean> {
+  const size = (await file.stat()).size;
+  const tail = await readAt(file, Math.max(0, size - 4 * 1024 * 1024), Math.min(size, 4 * 1024 * 1024));
+  const at = tail.lastIndexOf(COOKIE);
+  if (at < 0) return false;
+  const cookie = tail.subarray(at, at + COOKIE_SIZE);
+  const start = size - tail.length + at + COOKIE_SIZE - cookie.readUInt32BE(8);
+  const toc = await readAt(file, start + cookie.readUInt32BE(12), cookie.readUInt32BE(16));
+  const entries: Buffer[] = [];
+  for (let pos = 0; pos < toc.length; pos += toc.readUInt32BE(pos)) {
+    if (UNPACKED_TYPES.includes(String.fromCharCode(toc[pos + 17]))) entries.push(toc.subarray(pos, pos + toc.readUInt32BE(pos)));
+  }
+  // Thousands of small files: written in batches, so the disk stays busy without opening them all at once.
+  for (let i = 0; i < entries.length; i += 64) await Promise.all(entries.slice(i, i + 64).map((entry) => unpackEntry(file, start, entry, out)));
+  return true;
+}
+
+// One table entry: data offset, stored and full length, a compression flag, a type code and the name.
+async function unpackEntry(file: FileHandle, start: number, entry: Buffer, out: string): Promise<void> {
+  const target = join(out, ...entry.subarray(18).toString('utf8').replace(/\0+$/, '').split(/[\\/]/));
+  const data = await readAt(file, start + entry.readUInt32BE(4), entry.readUInt32BE(8));
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, entry[16] === 1 ? await inflateAsync(data) : data);
+}
+
+async function readAt(file: FileHandle, position: number, length: number): Promise<Buffer> {
+  const buffer = Buffer.alloc(length);
+  await file.read(buffer, 0, length, position);
+  return buffer;
 }
 
 async function download(url: string, file: string, onProgress?: (fraction: number) => void): Promise<void> {
