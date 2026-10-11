@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { scheduleLodestarNotice } from './lodestar.js';
 import { AntigravityChatProvider } from './provider.js';
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -15,6 +16,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
   provider.focusChanged(vscode.window.state.focused);
   provider.start();
+  scheduleLodestarNotice(context);
 }
 
 async function manage(provider: AntigravityChatProvider, log: vscode.LogOutputChannel): Promise<void> {

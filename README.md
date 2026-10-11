@@ -2,6 +2,8 @@
 
 Use your Google Antigravity plan's models in GitHub Copilot Chat. Requests go through Google's official Antigravity ACP server, the one Zed and JetBrains install from the [ACP registry](https://agentclientprotocol.com/get-started/registry), running unmodified on your machine. You sign in on Google's own page and the server keeps the tokens.
 
+> Also from the same developer: [Lodestar](https://marketplace.visualstudio.com/items?itemName=DenizhanDaklr.lodestar) walks you through how code works and reviews your changes, on any model in VS Code, including this extension's. $10, one time.
+
 1. Pick an Antigravity model in the Copilot Chat model picker. The first time, the extension downloads the server (about 125 MB) and asks you to sign in with Google.
 2. Next to the model, pick the thinking effort and the permissions.
 
