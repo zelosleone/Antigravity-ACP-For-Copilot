@@ -154,8 +154,12 @@ function pushBlock(blocks: Block[], part: unknown): void {
   else if (isImage(part)) blocks.push({ type: 'image', data: Buffer.from(part.data).toString('base64'), mimeType: part.mimeType });
 }
 
-function isImage(part: unknown): part is vscode.LanguageModelDataPart {
-  return part instanceof vscode.LanguageModelDataPart && IMAGE_TYPES.includes(part.mimeType);
+// Data parts arrived in VS Code 1.106; editors built on older ones (Antigravity, Cursor) have none.
+type DataPart = { data: Uint8Array; mimeType: string };
+const DataPartClass = (vscode as { LanguageModelDataPart?: new (...args: never[]) => DataPart }).LanguageModelDataPart;
+
+function isImage(part: unknown): part is DataPart {
+  return DataPartClass !== undefined && part instanceof DataPartClass && IMAGE_TYPES.includes(part.mimeType);
 }
 
 function transcript(history: readonly Message[], results?: Map<string, Block[]>): string {

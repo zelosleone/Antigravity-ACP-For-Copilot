@@ -34,6 +34,8 @@ export class AntigravityChatProvider implements vscode.LanguageModelChatProvider
   private models: AgyModel[];
   private refreshing?: Promise<void>;
   private prompting = false;
+  // A failed model refresh restarts a signed-out server, which would cut off a sign-in running on it.
+  private signingIn = false;
   private awaySince?: number;
   private asleep = false;
   private readonly timer = setInterval(() => this.sleepIfAway(), 60_000);
@@ -112,6 +114,7 @@ export class AntigravityChatProvider implements vscode.LanguageModelChatProvider
   /** Google's own sign-in page opens in the browser; the server keeps the tokens, never this extension. */
   async signIn(): Promise<void> {
     const title = 'Antigravity: finish signing in with Google in your browser';
+    this.signingIn = true;
     const done = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title, cancellable: true }, async (_progress, token) => {
       const cancel = token.onCancellationRequested(() => this.agent.restart());
       try {
@@ -122,6 +125,7 @@ export class AntigravityChatProvider implements vscode.LanguageModelChatProvider
         throw error;
       } finally {
         cancel.dispose();
+        this.signingIn = false;
       }
     });
     if (done) await this.refresh();
@@ -177,6 +181,7 @@ export class AntigravityChatProvider implements vscode.LanguageModelChatProvider
       this.log.info(`${this.describe()}: ${this.models.length} models`);
     } catch (error) {
       if (!(error instanceof AgentError && error.signedOut)) return this.log.warn(`Model refresh failed: ${String(error)}`);
+      if (this.signingIn) return;
       // Signing in starts it again.
       this.restart();
       this.setChoices([]);

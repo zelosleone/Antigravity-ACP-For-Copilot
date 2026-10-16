@@ -1,8 +1,8 @@
 {
   "name": "antigravity-acp-for-copilot",
-  "displayName": "Antigravity: Copilot Provider",
-  "description": "Use your Google Antigravity plan's Gemini models in GitHub Copilot Chat, through Google's official Antigravity ACP server on your machine.",
-  "version": "0.4.4",
+  "displayName": "Antigravity Models (ACP)",
+  "description": "Your Google Antigravity plan's Gemini models in Copilot Chat and Lodestar, through Google's official Antigravity ACP server on your machine. Works in VS Code, Antigravity IDE and other VS Code-based editors.",
+  "version": "0.4.5",
   "type": "module",
   "publisher": "DenizhanDaklr",
   "license": "MIT",
@@ -16,7 +16,7 @@
     "url": "https://github.com/zelosleone/Antigravity-ACP-For-Copilot/issues"
   },
   "engines": {
-    "vscode": "^1.118.0"
+    "vscode": "^1.105.0"
   },
   "categories": [
     "AI",
@@ -66,7 +66,7 @@
   "devDependencies": {
     "@agentclientprotocol/sdk": "1.7.0",
     "@types/node": "20.19.30",
-    "@types/vscode": "^1.118.0",
+    "@types/vscode": "1.105.0",
     "@typescript-eslint/eslint-plugin": "8.53.0",
     "@typescript-eslint/parser": "8.53.0",
     "@vscode/vsce": "^4.0.0",

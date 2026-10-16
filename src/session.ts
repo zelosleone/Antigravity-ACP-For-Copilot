@@ -137,8 +137,9 @@ export class Session implements SessionHandler, ToolHost {
     await this.adjust(false);
     // A replayed or resumed history already holds this many replies, so the next request counts on from here.
     this.responses = request.assistantCount;
-    // Nothing ever follows up on a side request, so its session goes as soon as it has answered.
-    this.oneShot = request.fork;
+    // Nothing ever follows up on a side request, or on a request with no chat and no tools (other
+    // extensions' one-off calls), so its session and harness go as soon as it has answered.
+    this.oneShot = request.fork || (!this.context.conversation && this.settings.tools.length === 0);
     this.send(prompt);
   }
 
@@ -395,7 +396,7 @@ export class Session implements SessionHandler, ToolHost {
     this.state = reply.calls.length > 0 ? 'awaiting' : 'idle';
     // Copilot reads this data part to drive its context window indicator.
     const used = this.used;
-    if (used > 0) progress.report(vscode.LanguageModelDataPart.json({ prompt_tokens: used, completion_tokens: 0, total_tokens: used }, 'usage'));
+    if (used > 0) reportUsage(progress, used);
     if (this.oneShot && this.state === 'idle') return this.close();
     if (this.state === 'idle') this.saved.put(this.key, { id: this.id, responses: this.responses, lastText: this.lastText, cwd: this.context.cwd, mode: this.settings.mode, at: Date.now() });
   }
@@ -653,6 +654,12 @@ class Inbox<T> {
 function pick(options: acp.SessionConfigOption[] | null | undefined): [ModelChoice[], string] {
   const { choices, current } = modelOption(options);
   return [choices, current ?? ''];
+}
+
+// Copilot's context window indicator reads usage from a data part, where VS Code has them.
+function reportUsage(progress: Progress, used: number): void {
+  const Part = (vscode as { LanguageModelDataPart?: { json(value: object, mime: string): vscode.LanguageModelResponsePart } }).LanguageModelDataPart;
+  if (Part) progress.report(Part.json({ prompt_tokens: used, completion_tokens: 0, total_tokens: used }, 'usage'));
 }
 
 // Gemini's thinking, where VS Code offers a part for it (not yet in the stable typings).

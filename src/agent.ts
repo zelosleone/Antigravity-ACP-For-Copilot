@@ -270,7 +270,7 @@ export class Agent implements vscode.Disposable {
 
   // ACP leaves it to the client to go when the server answers with a protocol version it doesn't speak.
   private async initialize(connection: Connection, server: Server, timeoutMs: number): Promise<acp.InitializeResponse> {
-    const clientInfo = { name: 'antigravity-acp-for-copilot', title: 'Antigravity for Copilot', version: this.version };
+    const clientInfo = { name: 'antigravity-acp-for-copilot', title: 'Antigravity Models', version: this.version };
     const noLocalAccess = { fs: { readTextFile: false, writeTextFile: false }, terminal: false };
     const answer = connection.request<acp.InitializeResponse>('initialize', { protocolVersion: PROTOCOL_VERSION, clientCapabilities: noLocalAccess, clientInfo });
     const initialized = await within(answer, timeoutMs, `Antigravity's ACP server ${server.version} didn't answer within ${timeoutMs / 1000} s.`);

@@ -1,6 +1,6 @@
-# Antigravity for Copilot
+# Antigravity Models (ACP)
 
-Use your Google Antigravity plan's models in GitHub Copilot Chat. Requests go through Google's official Antigravity ACP server, the one Zed and JetBrains install from the [ACP registry](https://agentclientprotocol.com/get-started/registry), running unmodified on your machine. You sign in on Google's own page and the server keeps the tokens.
+Use your Google Antigravity plan's models in GitHub Copilot Chat, and in [Lodestar](https://marketplace.visualstudio.com/items?itemName=DenizhanDaklr.lodestar) in any VS Code-based editor, Antigravity IDE included. Requests go through Google's official Antigravity ACP server, the one Zed and JetBrains install from the [ACP registry](https://agentclientprotocol.com/get-started/registry), running unmodified on your machine. You sign in on Google's own page and the server keeps the tokens.
 
 > Also from the same developer: [Lodestar](https://marketplace.visualstudio.com/items?itemName=DenizhanDaklr.lodestar) walks you through how code works, explains anything you hover, and reviews your changes on any model in VS Code, including this extension's. 3 free runs included, then $5 one-time.
 
@@ -8,6 +8,10 @@ Use your Google Antigravity plan's models in GitHub Copilot Chat. Requests go th
 2. Next to the model, pick the thinking effort and the permissions.
 
 Models, effort levels and context windows all come from the server. Copilot keeps its own agent, tools, approvals and diffs; Gemini is the model behind them.
+
+## In Antigravity IDE and other editors
+
+Editors without Copilot (Antigravity IDE, VSCodium and others) still get the models: other extensions can use them through VS Code's language model API. In Lodestar, run **Lodestar: Use Antigravity Models**; it installs this extension if needed and opens Google's sign-in. Install it there from Open VSX.
 
 ## Permissions
 

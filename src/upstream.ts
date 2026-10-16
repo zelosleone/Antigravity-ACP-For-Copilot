@@ -31,7 +31,7 @@ async function start(server: Server, unpacked: string | undefined): Promise<void
   const connection = new Connection(child, () => undefined);
   child.once('exit', (code) => connection.close(new Error(`the server exited (code ${code})`)));
   try {
-    const clientInfo = { name: 'antigravity-acp-for-copilot', title: 'Antigravity for Copilot', version: 'upstream-check' };
+    const clientInfo = { name: 'antigravity-acp-for-copilot', title: 'Antigravity Models', version: 'upstream-check' };
     const capabilities = { fs: { readTextFile: false, writeTextFile: false }, terminal: false };
     const init = await connection.request<acp.InitializeResponse>('initialize', { protocolVersion: 1, clientCapabilities: capabilities, clientInfo });
     console.log(`${label}: initialize answered in ${((Date.now() - started) / 1000).toFixed(1)} s`);

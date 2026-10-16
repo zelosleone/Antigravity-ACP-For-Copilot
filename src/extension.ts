@@ -3,7 +3,7 @@ import { scheduleLodestarNotice } from './lodestar.js';
 import { AntigravityChatProvider } from './provider.js';
 
 export function activate(context: vscode.ExtensionContext): void {
-  const log = vscode.window.createOutputChannel('Antigravity for Copilot', { log: true });
+  const log = vscode.window.createOutputChannel('Antigravity Models', { log: true });
   const provider = new AntigravityChatProvider(context, log);
 
   context.subscriptions.push(
